@@ -63,26 +63,27 @@ SARIMAX had 4.
 17,592 distinct timestamps, so most hours appear 7 times. Test-time code steps through the blocks 168 rows at a time
 (`secondTierForecasts.py:630-631`).
 
-## 3. Fix or check these first (pre-existing issues; they would make any practice forecast meaningless)
+## 3. Weather alignment (issues 1 and 2 are fixed)
 
-1. **Second-tier training weather stride.** `manipulateTrainingDataShape` adds `weatherIdx += 23` at each day boundary
-   (`secondTierForecasts.py:502`), so each day advances 47 rows, not 168. Day *d*'s training samples read weather rows
-   from about 47·*d*, which is block ≈ 0.28·*d*. By day 100 the model is paired with weather issued around day 28. The
-   original line was `weatherIdx += (MAX_PREDICTION_WINDOW_HOURS-24)`; it was changed in commit `84e74bb`. The first
-   tier still uses the 168 stride (`firstTierForecasts.py:615`), and so does test time. The result is that training
-   and test pair weather with history differently.
-2. **`sort_index()` on the overlapping forecast file.** `modify_data_for_chunk` sorts the forecast DataFrame by
-   timestamp (`run_6month_forecasting.py:95`). This puts the ~7 copies of each hour next to each other, so after the
-   date slice every 168 rows are no longer one issue's 7-day block. `splitWeatherDataset` (`common.py:236`) and both
-   rollouts assume they are. The merge step's own comment says that sorting destroys the block structure (`DO NOT
-   SORT`), but the input is sorted anyway. The slice is also by row timestamp, not by issue date, so the first and
-   last blocks are partial.
-3. **Which day's weather is paired with which input.** In both training and the rollout, step *j* uses block rows
-   `j*24 : j*24+24`. Those rows cover the *history* day, not the day being predicted. This is consistent between train
-   and test once (1) and (2) are fixed, so it is not a bug. The practice rollout has to reproduce it exactly.
+Issues 1 and 2 would have made any practice forecast meaningless. Both are now fixed.
+With the fixes, every training, validation and test input in both chunks gets weather
+for exactly its own hours (checked on the AECI data). Before them, that held for 0% of inputs.
 
-Checking for (1) and (2): print the timestamps of the weather rows paired with a training sample on day 100, and for
-the first test origin.
+1. **Second-tier training weather stride (fixed).** `manipulateTrainingDataShape` added `weatherIdx += 23` at each
+   day boundary (`secondTierForecasts.py:502`), so each day advanced 47 rows, not 168. Day *d*'s training samples read
+   weather from block ≈ 0.28·*d*. The line was changed in commit `84e74bb` and has been restored to
+   `weatherIdx += (MAX_PREDICTION_WINDOW_HOURS-24)`, matching the first tier and test time.
+2. **`sort_index()` on the overlapping forecast file (fixed).** `modify_data_for_chunk` sorted the forecast DataFrame
+   by timestamp and sliced it by row timestamp, so every 168 rows were no longer one issue's 7-day block.
+   `select_forecast_blocks` in `run_6month_forecasting.py` now keeps whole blocks in file order. It keeps blocks
+   issued from the chunk's first day through its last day minus `BUFFER_HOURS // 24` days, which is one block per
+   data day as `splitWeatherDataset` and both rollouts assume. At the 168 h horizon that is 6 days. Both
+   `PREDICTION_WINDOW_HOURS` and `MAX_PREDICTION_WINDOW_HOURS` are read from the config. It raises an error if the
+   file has a missing day or a broken block, for example after the weather aggregation drops a cycle.
+3. **Which day's weather is paired with which input (not a bug).** In both training and the rollout, block *b* is the
+   forecast issued on data day *b*, and step *j* uses block rows `j*24 : j*24+24`. Those rows cover the *history*
+   window's hours, not the day being predicted. This is consistent between train and test, so the practice rollout has
+   to reproduce it exactly.
 
 ## 4. The accuracy constraint
 
@@ -162,7 +163,7 @@ it did for SARIMAX. It can also be less stable, since errors compound through th
 | `getScores`, `:788-826` | RMSE, MAPE, daily MAPE | add the 168 h-window c-index (lifelines and smooth) on test, and on val for carry-over, so the result matches SARIMAX's "forecast-week c-index". |
 | main loop, `:177-244` | one CSV per experiment | loop over variants (`baseline`, `eps_<e>`) and write one CI forecast file per variant. These files feed `CarbonCast-SARIMAX-mat`'s R concordance and scheduling figures. |
 | `secondTierConfig.json` | `SECOND_TIER_CNN_LSTM_MODEL_HYPERPARAMS` | add a `CONCORDANCE` block: `EPS`, `TAU`, `PRACTICE_ORIGIN_STRIDE_DAYS`, `PRACTICE_PERIOD` (train), solver settings and `SEEDS`. |
-| `run_6month_forecasting.py:26-60, 168` | per-chunk config and merge | pass the eps settings through, and merge per variant. |
+| `run_6month_forecasting.py`: `create_chunk_config`, `merge_forecast_results` | per-chunk config and merge | pass the eps settings through, and merge per variant. |
 
 ### 6.2 Solving the constrained problem
 SLSQP is not usable here. It builds a dense quasi-Newton matrix (17,340² ≈ 300M entries), and finite differences

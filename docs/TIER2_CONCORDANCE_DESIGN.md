@@ -147,7 +147,8 @@ This was checked against `getDayAheadForecasts` (`:594-642`):
 - Gradients pass through all 7 calls (backpropagation through the recursion). The cost is 7 forward passes on a
   batch of 173.
 
-The `wx` indexing assumes the 168-row block structure. It only holds once the `sort_index` issue is fixed
+The `wx` indexing assumes the 168-row block structure, one block per data day. `select_forecast_blocks` in
+`run_6month_forecasting.py` guarantees this and raises an error if the forecast file breaks it
 (`CONCORDANCE_INTEGRATION.md` section 3, item 2).
 
 ### 3.3 Weather in C_A vs C_B
@@ -262,22 +263,22 @@ for step in range(S):
 
 | Location | What happens there |
 |---|---|
-| **Precondition:** `secondTierForecasts.py:502` and `run_6month_forecasting.py:95` | Fix or verify the weather stride and `sort_index` bugs first (`CONCORDANCE_INTEGRATION.md` section 3). Otherwise X's weather (C_A) and the `wTrainData` blocks (C_B) are misaligned. |
+| **Precondition (done):** `secondTierForecasts.py:502` and `select_forecast_blocks` in `run_6month_forecasting.py` | The weather stride and `sort_index` bugs are fixed (`CONCORDANCE_INTEGRATION.md` section 3). Without those fixes, X's weather (C_A) and the `wTrainData` blocks (C_B) would be misaligned. |
 | New module `src/concordance_tier2.py` | `build_windows`, `smooth_c`, `rollout_B`, `mse_train`, `solve_output_slsqp`, `switching_gradient`, `best_within` |
 | `trainingandValidationPhase`, after the `trainModel` call (`:868`) | Compute MSE_0, run the eps sweep and return `{"baseline": theta_0, "eps_<e>": theta_e, ...}`. Everything needed is already in scope. |
 | `trainModel`, `:524-584` | Unchanged. The existing `-s` flag loads the saved `<region>.h5` (`:535-538`), so the sweep can run on baselines you already have, with no retraining. |
 | Main loop in `runSecondTier`, `:177-190` | Loop over the variants. Call the **unchanged** `getDayAheadForecasts` on test for each one and write one CI forecast CSV per variant. |
 | `getScores`, `:788-826` | Add the 168 h-window c-index, both lifelines and smooth, so it matches SARIMAX's forecast-week c-index. |
 | `secondTierConfig.json` | Add a `CONCORDANCE` block: `OBJECTIVE` (`C24`, `A` or `B`), `EPS`, `TAU`, `SOLVER` (`slsqp_output` or `switching`), `SEEDS`. |
-| `run_6month_forecasting.py:26-60, 168` | Pass the settings through and merge per variant. |
+| `run_6month_forecasting.py`: `create_chunk_config`, `merge_forecast_results` | Pass the settings through and merge per variant. |
 
 **Validation and carry-over.** Build the same windows from `valX, valY, wValData` (Jul–Dec 2022 for H1). Use them
 only to measure each variant and to choose eps, never inside the solver.
 
 ## 7. Order of work
 
-1. **Fix or verify the two alignment bugs.** Print the weather timestamps paired with a day-100 training sample and
-   with the first test origin.
+1. **Fix the two alignment bugs (done).** Both are fixed, and every training, validation and test input now gets
+   weather for its own hours. Re-check this after any change to the weather data or the chunk dates.
 2. **Port `smooth_c`** and test it against the numpy version.
 3. **Headroom check on the baseline.** Compute C_24, C_A and C_B on train and val, plus the hard (lifelines) c-index
    of the real test rollouts. A large C_A–C_B gap means C_A is not a safe stand-in for the test rollout.
