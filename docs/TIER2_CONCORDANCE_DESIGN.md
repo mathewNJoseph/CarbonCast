@@ -48,9 +48,9 @@ Typical examples are a sharper diurnal contrast, or correct relative levels betw
 7. **Choose eps on the validation half-year,** where the gain actually carries over. Then run that model once on the
    test half-year.
 
-The switching-gradient fallback (section 5.2) walks through the full network's weights instead. It climbs concordance
-while feasible and descends MSE when it is not. The final pick is the same rule: the most concordant checkpoint that
-satisfied the constraint.
+The switching gradient (section 5.2) takes plain gradient steps instead, on the output layer or on the whole network.
+It climbs concordance while feasible and descends MSE when it is not. The final pick is the same rule: the most
+concordant checkpoint that satisfied the constraint. Both solvers are run and compared (section 5.3).
 
 ### 0.4 Where it differs from SARIMAX
 
@@ -191,9 +191,9 @@ def smooth_c(F, A_act, tau=0.1):
 
 ## 5. Solving the constrained problem
 
-Neither solver combines C and MSE into one loss.
+Neither solver combines C and MSE into one loss. Both are run, and the results are compared side by side (5.3).
 
-### 5.1 First solver: SLSQP on the output `Dense(24)` (600 weights)
+### 5.1 SLSQP on the output `Dense(24)` (600 weights)
 
 Freeze every layer below the final `Dense(24)` (`:565`). The penultimate activations
 `H = penultimate(X, training=False)` (the LSTM → Dropout output, shape (N, 24)) are then **fixed**:
@@ -227,10 +227,15 @@ res = minimize(lambda w: -C(w), w0, jac=lambda w: -gradC(w), method="SLSQP",
 - **Write back** with `model.layers[-1].set_weights([W, b])` and save the model as `<region>_eps_<e>.h5`.
 - **Limitation:** only the output mapping moves, so the network cannot learn new features.
 
-### 5.2 Fallback solver: switching gradient on the whole network
+### 5.2 Switching gradient (output layer or whole network)
 
-Use this if 600 weights give too little room (a flat frontier in 5.1). It is Polyak's switching gradient method; the
-stochastic version is Lan & Zhou's cooperative stochastic approximation.
+This is Polyak's switching gradient method; the stochastic version is Lan & Zhou's cooperative stochastic
+approximation. It runs inside TF with ordinary gradient steps, so it is not limited by SLSQP's dense matrix and can
+move every weight. It runs on two sets of weights (section 5.3):
+
+- **Output layer only:** apply gradients to `model.layers[-1].trainable_variables` alone. This is the same problem
+  as 5.1, so the two answers can be checked against each other.
+- **Whole network:** apply gradients to `model.trainable_variables`.
 
 ```python
 optC, optM = Adam(lr_c), Adam(lr_m)       # separate optimizers, so moment estimates don't mix objectives
@@ -259,7 +264,49 @@ for step in range(S):
 - **To implement it,** use either a custom `GradientTape` loop or a `keras.Model` subclass whose `train_step` reads a
   `tf.Variable` mode flag, plus a batch-end callback that sets the flag. Either replaces
   `ModelCheckpoint(val_loss)` (`:572`) for this stage.
-- K (for example 20 steps), the two learning rates and S need a small tuning pass. Tune on train only.
+- K (for example 20 steps), the two learning rates and S need a small tuning pass. Tune on train only, using the
+  output-layer run: settings are good when its train C at each eps comes close to SLSQP's (5.1). Use the same
+  settings for the whole-network run.
+
+### 5.3 Comparing the solvers
+
+Run all three variants on the same chunk, seeds, baseline theta_0, practice objective (C_A, then C_B) and eps grid.
+
+| Variant | Solver | Weights moved | Purpose |
+|---|---|---|---|
+| A | SLSQP (5.1) | output layer (600) | the precise constrained optimum; the reference |
+| B | switching (5.2) | output layer (600) | checks the switching loop: it should land close to A |
+| C | switching (5.2) | whole network (~17k) | tests whether more freedom gives more concordance |
+
+**Report for every variant and eps:**
+
+- the MSE_train ratio;
+- train C;
+- val C and val MSE;
+- test 168 h c-index, MAE and MAPE;
+- run time.
+
+"Val C" is the 168 h c-index of the real rollouts on the validation half-year. Let sigma be the standard deviation of
+the baseline's val C across seeds.
+
+**Reading the results:**
+
+- **A and B agree:** the switching loop is reliable, so C's numbers can be trusted.
+- **B is well below A:** the switching settings need more tuning. Fix that before trusting C.
+- **C beats A on val by more than sigma:** the whole network is worth using.
+- **C beats A on train only:** it is fitting the practice windows, not ordering better. Keep A.
+
+**When the output layer is not good enough.** A falls short if either of these holds:
+
+- at the best eps, val C rises by less than about sigma over the baseline, so the change is indistinguishable from
+  seed noise;
+- train C rises but val C does not, so the output layer is fitting the practice windows.
+
+If A's answer also sits on the MSE boundary at every eps while train C barely moves, 600 weights are too few, and C
+is the variant that can help.
+
+**Choose on val, test once.** Pick eps and the winning variant on validation. Report all three variants' test
+numbers, but only after the pick is fixed.
 
 ## 6. Where it plugs into the code (nothing edited)
 
@@ -271,7 +318,7 @@ for step in range(S):
 | `trainModel`, `:524-584` | Unchanged. The existing `-s` flag loads the saved `<region>.h5` (`:535-538`), so the sweep can run on baselines you already have, with no retraining. |
 | Main loop in `runSecondTier`, `:177-190` | Loop over the variants. Call the **unchanged** `getDayAheadForecasts` on test for each one and write one CI forecast CSV per variant. |
 | `getScores`, `:788-826` | Add the 168 h-window c-index, both lifelines and smooth, so it matches SARIMAX's forecast-week c-index. |
-| `secondTierConfig.json` | Add a `CONCORDANCE` block: `OBJECTIVE` (`C24`, `A` or `B`), `EPS`, `TAU`, `SOLVER` (`slsqp_output` or `switching`), `SEEDS`. |
+| `secondTierConfig.json` | Add a `CONCORDANCE` block: `OBJECTIVE` (`C24`, `A` or `B`), `EPS`, `TAU`, `SOLVERS` (any of `slsqp_output`, `switching_output`, `switching_all`), `SEEDS`. |
 | `run_6month_forecasting.py`: `create_chunk_config`, `merge_forecast_results` | Pass the settings through and merge per variant. |
 
 **Validation and carry-over.** Build the same windows from `valX, valY, wValData` (Jul–Dec 2022 for H1). Use them
@@ -284,13 +331,16 @@ only to measure each variant and to choose eps, never inside the solver.
 2. **Port `smooth_c`** and test it against the numpy version.
 3. **Headroom check on the baseline.** Compute C_24, C_A and C_B on train and val, plus the hard (lifelines) c-index
    of the real test rollouts. A large C_A–C_B gap means C_A is not a safe stand-in for the test rollout.
-4. **Output-layer SLSQP with C_A** over the eps grid. This should take minutes per chunk.
-5. **Repeat with C_B.** Try the switching gradient if the frontier is flat.
-6. **Choose eps on val, then test once.** Run 3–5 seeds. Count a gain only if it beats the baseline's seed-to-seed
-   spread. Report for every variant:
+4. **Output-layer SLSQP with C_A** (variant A) over the eps grid. This should take minutes per chunk.
+5. **Switching gradient with C_A.** Tune it on the output layer until it matches A (variant B), then run it on the
+   whole network (variant C).
+6. **Repeat steps 4–5 with C_B.**
+7. **Choose eps and the variant on val, then test once.** Run 3–5 seeds. Count a gain only if it beats the
+   baseline's seed-to-seed spread (section 5.3). Report for every variant:
    - the MSE_train ratio, and `MSE_LS / MSE0`;
    - train C;
    - val C and val MSE;
-   - test 168 h c-index, MAE and MAPE.
+   - test 168 h c-index, MAE and MAPE;
+   - run time.
 
    Feed the per-variant CSVs into the scheduling code as described in `CONCORDANCE_INTEGRATION.md` section 7.

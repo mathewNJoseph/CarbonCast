@@ -174,13 +174,13 @@ would cost 17k rollouts per gradient. Options, from cheapest to most faithful:
    (training MSE, practice C) at every epoch, over several seeds and learning rates. The answer for each eps is the
    most concordant checkpoint within the floor. This is SARIMAX's `best_within` over a pool of points. It takes
    a few hours to build and shows whether the frontier exists at all.
-2. **SLSQP on the output layer (run first; the SARIMAX formulation unchanged).** Freeze everything except the final
+2. **SLSQP on the output layer (the SARIMAX formulation unchanged).** Freeze everything except the final
    Dense layer: 600 weights in tier 2, 840 in tier 1. Pass objective and constraint to scipy separately:
    `fun = -C_train(w)` and `constraints = [{"type": "ineq", "fun": (1+eps)*MSE_0 - MSE_train(w)}]`. Both gradients
    come exactly from TF autodiff over the full training set (about 4,300–4,400 samples in one batch), so runs are
    deterministic. Use the same two starts and `best_within` pooling as `constraint_study.sweep`. Limitation: only the
    output mapping moves, so the network cannot learn new features.
-3. **Switching gradient (whole network, if the output layer has too little room).** This is Polyak's switching
+3. **Switching gradient (output layer or whole network).** This is Polyak's switching
    gradient method; its stochastic version is Lan & Zhou's cooperative stochastic approximation. Start from the
    baseline, which is feasible. Every K steps (for example, 20 batches), evaluate the full training MSE with dropout
    off. If `MSE_train <= (1+eps)*MSE_0`, the next K steps do gradient ascent on C only; otherwise they do gradient
@@ -188,6 +188,10 @@ would cost 17k rollouts per gradient. Options, from cheapest to most faithful:
    feasible checkpoint (`best_within`). Each step follows one objective and C and MSE are never summed, so there is
    no multiplier or weighted loss. To implement it, use a `keras.Model` subclass whose `train_step` reads a
    `tf.Variable` flag, plus a batch-end callback that sets the flag and replaces `ModelCheckpoint(val_loss)`.
+
+Options 2 and 3 are both run and compared: SLSQP on the output layer, switching on the output layer (which should
+match it), and switching on the whole network. `TIER2_CONCORDANCE_DESIGN.md` section 5.3 gives the comparison and how
+to read it.
 
 Do not combine C and MSE into one loss (for example `-C + lam*g`). The formulation keeps the objective and the
 constraint separate.
