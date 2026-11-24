@@ -28,8 +28,8 @@ Typical examples are a sharper diurnal contrast, or correct relative levels betw
 
 ### 0.3 How the optimisation moves the model (SLSQP on the output layer, one eps)
 
-1. **Start from the baseline weights.** Compute the baseline training MSE and the practice c-index on the 173
-   training windows.
+1. **Start from the baseline weights.** Compute the baseline training MSE and the practice c-index on the W
+   training windows (W = 174 for H1, 177 for H2).
 2. **Each pair of hours pushes the weights.** For a pair where actual hour j is higher than actual hour i, the smooth
    term is `sigmoid((f_j − f_i) / (0.1·std(f)))`, and its gradient says to raise f_j relative to f_i.
    - Nearly tied or slightly wrong pairs push hardest, because that is where the sigmoid is steepest.
@@ -85,14 +85,15 @@ subject to  MSE_train(theta) <= (1 + eps) * MSE_train(theta_0)    the loss fit()
 `trainingandValidationPhase` (`secondTierForecasts.py:855-870`) already has everything in scope:
 
 - `X, y = manipulateTrainingDataShape(trainData, 24, 24, wTrainData)` (`:860`):
-  - **X**, shape (≈4273, 24, 15). The columns are `[CI, 5 calendar, 9 weather/source forecasts]`. The column order
+  - **X**, shape (N, 24, 15), with N = 4,297 samples for H1 and 4,369 for H2. The columns are `[CI, 5 calendar, 9 weather/source forecasts]`. The column order
     is the same as the test input built in `getForecasts` (`:673-684`).
-  - **y**, shape (≈4273, 24).
+  - **y**, shape (N, 24).
   - Sample `i` covers history hours `i…i+23` and label hours `i+24…i+47`.
 - `valX, valY` (`:862`), plus `wTrainData` and `wValData`.
 
-Sample `i = 24d` (hour 0 of day d) is therefore "history = day d → predict day d+1". A 180-day chunk gives 179 such
-daily samples and **173 seven-day windows** (w = 0…172), each covering days w+1…w+7.
+Sample `i = 24d` (hour 0 of day d) is therefore "history = day d → predict day d+1". H1's 181 training days give 180 such
+daily samples and **W = 174 seven-day windows** (w = 0…W−1), each covering days w+1…w+7. H2's 184 days give
+183 daily samples and W = 177.
 
 Before using this indexing, check that `trainData[0]` is hour 0 (the hour sin/cos column), so that `24d` really is
 a day boundary.
@@ -118,25 +119,25 @@ C_A is only an index into the existing `X, y`:
 
 ```python
 day   = np.arange(0, len(X), 24)                    # hour-0 samples
-win   = day[np.arange(173)[:, None] + np.arange(7)] # (173, 7) sample indices
-A_act = y[win].reshape(173, 168)                    # actuals per window
-F_A   = model(X[win].reshape(-1, 24, 15), training=False)   # (173*7, 24)
-F_A   = tf.reshape(F_A, (173, 168))
+win   = day[np.arange(W)[:, None] + np.arange(7)] # (W, 7) sample indices
+A_act = y[win].reshape(W, 168)                    # actuals per window
+F_A   = model(X[win].reshape(-1, 24, 15), training=False)   # (W*7, 24)
+F_A   = tf.reshape(F_A, (W, 168))
 ```
 
 ### 3.2 C_B: the test rollout, batched in TF
 
 ```python
-hist_ci = X[24*w, :, 0:1]                                  # true CI of day w            (173, 24, 1)
+hist_ci = X[24*w, :, 0:1]                                  # true CI of day w            (W, 24, 1)
 cal[k]  = X[24*(w+k), :, 1:6]                              # true calendar, history day of step k
 wx[k]   = wTrainData[168*w + 24*k : 168*w + 24*k + 24]     # block w, rows 24k:24k+24 (as at :619)
 
 ci, out = hist_ci, []
 for k in range(7):
-    yk = model(tf.concat([ci, cal[:, k], wx[:, k]], -1), training=False)   # (173, 24)
+    yk = model(tf.concat([ci, cal[:, k], wx[:, k]], -1), training=False)   # (W, 24)
     out.append(yk)
     ci = yk[..., None]                                     # predicted CI becomes the next history
-F_B = tf.concat(out, 1)                                    # (173, 168)
+F_B = tf.concat(out, 1)                                    # (W, 168)
 ```
 
 This was checked against `getDayAheadForecasts` (`:594-642`):
@@ -145,7 +146,7 @@ This was checked against `getDayAheadForecasts` (`:594-642`):
 - The weather comes from the block issued on the origin's history day. At test, `weatherData[j:j+24]` (`:619`) is
   sliced from one 168-row block per origin (`:630-631`).
 - Gradients pass through all 7 calls (backpropagation through the recursion). The cost is 7 forward passes on a
-  batch of 173.
+  batch of W.
 
 The `wx` indexing assumes the 168-row block structure, one block per data day. `select_forecast_blocks` in
 `run_6month_forecasting.py` guarantees this and raises an error if the forecast file breaks it
@@ -185,7 +186,8 @@ def smooth_c(F, A_act, tau=0.1):
 - **`sd` stays inside the graph,** so the optimizer cannot raise C by stretching the forecast.
 - **Drop flat windows.** Windows with no untied pairs should be excluded (SARIMAX returns NaN for them).
 - **Verify the port.** Check every window against the numpy `smooth_concordance` to 1e-9 before using it.
-- **Memory:** 173 × 14,028 pairs ≈ 2.4M values, which fits easily. For C_24, use `triu_indices(24, 1)` and 179 windows.
+- **Memory:** W × 14,028 pairs ≈ 2.5M values, which fits easily. For C_24, use `triu_indices(24, 1)` and the 180–183 daily
+  samples.
 
 ## 5. Solving the constrained problem
 
@@ -194,7 +196,7 @@ Neither solver combines C and MSE into one loss.
 ### 5.1 First solver: SLSQP on the output `Dense(24)` (600 weights)
 
 Freeze every layer below the final `Dense(24)` (`:565`). The penultimate activations
-`H = penultimate(X, training=False)` (the LSTM → Dropout output, shape (4273, 24)) are then **fixed**:
+`H = penultimate(X, training=False)` (the LSTM → Dropout output, shape (N, 24)) are then **fixed**:
 
 - **Constraint:** `MSE(W, b) = mean((H W + b − y)^2)`. This is an exact quadratic, so the feasible set is an
   ellipsoid. That holds for every objective, C_B included, because the constraint only ever sees teacher-forced X.
@@ -240,7 +242,7 @@ for step in range(S):
             keep_if_best(c, model.get_weights())
         mode = "C" if r <= 1 + eps else "MSE"
     if mode == "C":
-        loss = -C_train(model)             # all 173 windows (full batch is cheap)
+        loss = -C_train(model)             # all W windows (full batch is cheap)
         opt = optC
     else:
         xb, yb = next_minibatch(X, y)

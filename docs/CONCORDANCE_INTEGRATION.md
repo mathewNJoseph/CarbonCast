@@ -51,10 +51,11 @@ training MSE, with a relative tolerance eps in place of delta (section 4).
 ### 2.2 Data periods (6-month chunks, `scripts/run_6month_forecasting.py`)
 | Chunk | Train | Val | Test |
 |---|---|---|---|
-| H1 | Jan–Jun 2022 (~180 days) | Jul–Dec 2022 (180) | Jan–Jun 2023 (180 + 6 buffer) |
-| H2 | Jul–Dec 2022 | Jan–Jun 2023 | Jul–Dec 2023 |
+| H1 | Jan–Jun 2022 (181 days) | Jul–Dec 2022 (184) | forecasts starting Jan 1–Jun 30 2023 (181), + 6 buffer days |
+| H2 | Jul–Dec 2022 (184) | Jan–Jun 2023 (181) | forecasts starting Jul 1–Dec 31 2023 (184; AECI stops at Dec 28) |
 
-There are about 4,300 training hours, which allows about 173 daily 168 h practice origins in the training period.
+There are 4,344 (H1) or 4,416 (H2) training hours, which allows 174 or 177 daily 168 h practice origins in the
+training period.
 SARIMAX had 4.
 
 ### 2.3 Weather layout
@@ -139,9 +140,9 @@ Skip origins whose 168 actuals are flat, as SARIMAX's `scored` mask does.
 
 **It must be differentiable.** `getForecasts` uses `model.predict` per call (`secondTierForecasts.py:681`), and
 `getDayAheadForecasts` is a Python loop over numpy lists, so neither carries gradients. The practice rollout should be
-written in TensorFlow: batch all origins (about 173) and call `model(x, training=False)` 7 times in sequence inside a
+written in TensorFlow: batch all origins (174–177) and call `model(x, training=False)` 7 times in sequence inside a
 `GradientTape`, concatenating the predicted CI into the next input. This is backpropagation through the 7-step
-recursion, the analogue of SARIMAX filtering through NaN endog. It is cheap: 7 forward passes on a batch of about 173.
+recursion, the analogue of SARIMAX filtering through NaN endog. It is cheap: 7 forward passes on a batch of about 175.
 
 **Port `smooth_concordance` to TF.** Use `triu_indices` over 168 → 14,028 pairs per window, mask the ties in the
 actuals, and keep `std(f)` inside the graph so the optimizer cannot gain by stretching the forecast.
@@ -176,7 +177,7 @@ would cost 17k rollouts per gradient. Options, from cheapest to most faithful:
 2. **SLSQP on the output layer (run first; the SARIMAX formulation unchanged).** Freeze everything except the final
    Dense layer: 600 weights in tier 2, 840 in tier 1. Pass objective and constraint to scipy separately:
    `fun = -C_train(w)` and `constraints = [{"type": "ineq", "fun": (1+eps)*MSE_0 - MSE_train(w)}]`. Both gradients
-   come exactly from TF autodiff over the full training set (about 4,300 samples in one batch), so runs are
+   come exactly from TF autodiff over the full training set (about 4,300–4,400 samples in one batch), so runs are
    deterministic. Use the same two starts and `best_within` pooling as `constraint_study.sweep`. Limitation: only the
    output mapping moves, so the network cannot learn new features.
 3. **Switching gradient (whole network, if the output layer has too little room).** This is Polyak's switching
