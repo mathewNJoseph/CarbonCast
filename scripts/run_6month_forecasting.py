@@ -9,6 +9,9 @@ Requirements:
 - First Run (H1 2023): Train Jan-Jun 2022, Val Jul-Dec 2022, Test Jan-Jun 2023
 - Second Run (H2 2023): Train Jul-Dec 2022, Val Jan-Jun 2023, Test Jul-Dec 2023
 - Output: Combined 2023 forecast covering full year
+
+"Test Jan-Jun 2023" means one forecast starting on each day of that range;
+the last one runs PREDICTION_WINDOW_HOURS past it. See CHUNKS.
 """
 
 import sys
@@ -23,6 +26,16 @@ import shutil
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
 import secondTierForecasts
 
+# Calendar dates of each chunk. test_start..test_end are the days the test
+# forecasts START on (one forecast per day). Training runs up to the day before
+# val_start, and validation up to the day before test_start.
+CHUNKS = {
+    "H1": {"train_start": "2022-01-01", "val_start": "2022-07-01",
+           "test_start": "2023-01-01", "test_end": "2023-06-30"},
+    "H2": {"train_start": "2022-07-01", "val_start": "2023-01-01",
+           "test_start": "2023-07-01", "test_end": "2023-12-31"},
+}
+
 def create_chunk_config(base_config_path, chunk_type, output_config_path):
     """
     Create a modified config file for the specific 6-month chunk.
@@ -34,11 +47,10 @@ def create_chunk_config(base_config_path, chunk_type, output_config_path):
     """
     with open(base_config_path, 'r') as f:
         config = json.load(f)
-    
-    # Update parameters for 6-month chunks
-    config["NUM_TEST_DAYS"] = 180  # 6 months = ~180 days
-    config["NUM_VAL_DAYS"] = 180   # 6 months = ~180 days
-    
+
+    # NUM_TEST_DAYS and NUM_VAL_DAYS depend on the chunk's dates and on how far
+    # the region's data reaches, so update_config_for_chunk_data sets them.
+
     # Update output file naming based on chunk
     for region in config["REGION_DIRECT"]:
         if region in config:
@@ -97,22 +109,28 @@ def select_forecast_blocks(forecasts_df, start_date, end_date, block_hours, pred
                          f"in order; {len(missing)} missing, e.g. {list(missing[:5].date)}")
     return forecasts_df.iloc[keep.repeat(block_hours)]
 
+def last_full_day(df):
+    """The last day whose 23:00 hour is present in an hourly, sorted DataFrame."""
+    return (df.index[-1] + pd.Timedelta(hours=1)).normalize() - pd.Timedelta(days=1)
+
 def modify_data_for_chunk(chunk_type, region, config):
     """
-    Modify the data files to implement the specific date ranges for each chunk.
-    This creates temporary data files with the appropriate date ranges.
-    
-    For H1: We want the data to be structured so that when split:
-    - Train: Jan-Jun 2022 (last 180 days before validation)
-    - Val: Jul-Dec 2022 (last 180 days before test) 
-    - Test: Jan-Jun 2023 (last 180 days)
-    
-    For H2: 
-    - Train: Jul-Dec 2022 (last 180 days before validation)
-    - Val: Jan-Jun 2023 (last 180 days before test)
-    - Test: Jul-Dec 2023 (last 180 days)
+    Write the chunk's emissions and forecast files, cut so that
+    secondTierForecasts' row-count split lands on the dates in CHUNKS.
+
+    secondTierForecasts takes the last NUM_TEST_DAYS + BUFFER_HOURS // 24 days
+    as test data, the NUM_VAL_DAYS before that as validation, and the rest as
+    training. So the chunk runs from train_start through test_end plus the
+    buffer days, which hold the actuals for the last forecast's horizon.
+
+    If the region's data stops too early for the last test forecasts (their
+    actuals, or the forecast block issued on their start day), test_end is
+    moved back to the last day the data supports and a warning names the
+    skipped days.
+
+    Returns the three file paths, NUM_VAL_DAYS and NUM_TEST_DAYS.
     """
-    
+
     # Read the full dataset
     direct_emissions_path = f"data/{region}/{region}_direct_emissions.csv"
     lifecycle_emissions_path = f"data/{region}/{region}_lifecycle_emissions.csv"
@@ -130,23 +148,42 @@ def modify_data_for_chunk(chunk_type, region, config):
     direct_df = direct_df.sort_index()
     lifecycle_df = lifecycle_df.sort_index()
 
-    if chunk_type == "H1":
-        # H1: Need data from Jan 2022 to Jun 2023 (18 months)
-        # This ensures: Train (Jan-Jun 2022) + Val (Jul-Dec 2022) + Test (Jan-Jun 2023)
-        start_date = "2022-01-01 00:00:00"
-        end_date = "2023-06-30 23:00:00"
-    else:  # H2
-        # H2: Need data from Jul 2022 to Dec 2023 (18 months) 
-        # This ensures: Train (Jul-Dec 2022) + Val (Jan-Jun 2023) + Test (Jul-Dec 2023)
-        start_date = "2022-07-01 00:00:00"
-        end_date = "2023-12-31 23:00:00"
-    
+    block_hours = config["MAX_PREDICTION_WINDOW_HOURS"]
+    prediction_hours = config["PREDICTION_WINDOW_HOURS"]
+    buffer_days = pd.Timedelta(days=(prediction_hours - 24) // 24)   # BUFFER_HOURS // 24
+    dates = {k: pd.Timestamp(v) for k, v in CHUNKS[chunk_type].items()}
+
+    # A test period ending on day d needs actuals through d + buffer_days, and
+    # select_forecast_blocks needs one forecast block per day through d.
+    supported_end = min(last_full_day(direct_df) - buffer_days,
+                        last_full_day(lifecycle_df) - buffer_days,
+                        forecasts_df.index[::block_hours].max())
+    test_end = min(dates["test_end"], supported_end)
+    if test_end < dates["test_start"]:
+        raise ValueError(f"{region} data ends too early for any {chunk_type} test forecast: the first one, "
+                         f"starting {dates['test_start'].date()}, needs actuals through "
+                         f"{(dates['test_start'] + buffer_days).date()}")
+    if test_end < dates["test_end"]:
+        print(f"WARNING: {region} data supports {chunk_type} test forecasts starting up to {test_end.date()} "
+              f"only. The {(dates['test_end'] - test_end).days} forecasts starting "
+              f"{(test_end + pd.Timedelta(days=1)).date()}..{dates['test_end'].date()} are skipped. Restoring them "
+              f"needs actuals through {(dates['test_end'] + buffer_days).date()} and forecast blocks issued "
+              f"through {dates['test_end'].date()}.")
+
+    start_date = dates["train_start"]
+    end_date = test_end + buffer_days + pd.Timedelta(hours=23)
+    num_val_days = (dates["test_start"] - dates["val_start"]).days
+    num_test_days = (test_end - dates["test_start"]).days + 1
+
     # Filter datasets by date range
     direct_chunk = direct_df[start_date:end_date]
     lifecycle_chunk = lifecycle_df[start_date:end_date]
-    forecasts_chunk = select_forecast_blocks(forecasts_df, start_date, end_date,
-                                             config["MAX_PREDICTION_WINDOW_HOURS"],
-                                             config["PREDICTION_WINDOW_HOURS"])
+    expected_hours = len(pd.date_range(start_date, end_date, freq="h"))
+    for name, chunk in (("direct", direct_chunk), ("lifecycle", lifecycle_chunk)):
+        if len(chunk) != expected_hours:
+            raise ValueError(f"{region} {name} emissions have {len(chunk)} rows for {start_date} to {end_date}, "
+                             f"not one per hour ({expected_hours}); the row-count split needs every hour")
+    forecasts_chunk = select_forecast_blocks(forecasts_df, start_date, end_date, block_hours, prediction_hours)
     
     # Save temporary chunk files
     chunk_dir = f"data/{region}/temp_{chunk_type}"
@@ -167,19 +204,25 @@ def modify_data_for_chunk(chunk_type, region, config):
     print(f"  Forecasts: {forecasts_chunk_path}")
     print(f"  Date range: {start_date} to {end_date}")
     print(f"  Data points: {len(direct_chunk)} hours")
-    
-    return direct_chunk_path, lifecycle_chunk_path, forecasts_chunk_path
+    print(f"  Train {start_date.date()}..{(dates['val_start'] - pd.Timedelta(days=1)).date()}, "
+          f"val {dates['val_start'].date()}..{(dates['test_start'] - pd.Timedelta(days=1)).date()}, "
+          f"test forecasts starting {dates['test_start'].date()}..{test_end.date()} ({num_test_days} days)")
 
-def update_config_for_chunk_data(config_path, chunk_type, direct_path, lifecycle_path, forecasts_path, region):
-    """Update the config to point to the chunk-specific data files."""
+    return direct_chunk_path, lifecycle_chunk_path, forecasts_chunk_path, num_val_days, num_test_days
+
+def update_config_for_chunk_data(config_path, chunk_type, direct_path, lifecycle_path, forecasts_path, region,
+                                 num_val_days, num_test_days):
+    """Point the config at the chunk's data files and set the chunk's day counts."""
     with open(config_path, 'r') as f:
         config = json.load(f)
-    
+
     # Update file paths for the region
     config[region]["DIRECT_CEF_IN_FILE_NAME"] = direct_path
     config[region]["LIFECYCLE_CEF_IN_FILE_NAME"] = lifecycle_path
     config[region]["FORECAST_IN_FILE_NAME"] = forecasts_path
-    
+    config["NUM_VAL_DAYS"] = num_val_days
+    config["NUM_TEST_DAYS"] = num_test_days
+
     # Save updated config
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=4)
@@ -344,11 +387,13 @@ def main():
             chunk_config = create_chunk_config(args.config_file, chunk_type, chunk_config_path)
 
             # Create chunk-specific data files
-            direct_path, lifecycle_path, forecasts_path = modify_data_for_chunk(chunk_type, args.region, chunk_config)
-            
+            direct_path, lifecycle_path, forecasts_path, num_val_days, num_test_days = modify_data_for_chunk(
+                chunk_type, args.region, chunk_config)
+
             # Update config to use chunk data
-            update_config_for_chunk_data(chunk_config_path, chunk_type, 
-                                       direct_path, lifecycle_path, forecasts_path, args.region)
+            update_config_for_chunk_data(chunk_config_path, chunk_type,
+                                       direct_path, lifecycle_path, forecasts_path, args.region,
+                                       num_val_days, num_test_days)
             
             # Run forecasting for this chunk
             if run_chunk_forecast(chunk_config_path, args.cef_type, args.load_saved_model, chunk_type):

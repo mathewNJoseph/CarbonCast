@@ -55,12 +55,17 @@ second tier then *learns* to predict CI, with the source forecasts as input feat
   - Actual source generation history is *not* an input; only CI history is.
 - **Output:** the next 24 h of CI.
 - **Training** follows the 6-month chunks (`scripts/run_6month_forecasting.py`). The model is trained **once per
-  chunk**, then forecasts all 180 test days with fixed weights.
+  chunk**, then forecasts every test day with fixed weights.
 
   | Chunk | Train | Val | Test |
   |---|---|---|---|
-  | H1 | Jan–Jun 2022 | Jul–Dec 2022 | Jan–Jun 2023 |
-  | H2 | Jul–Dec 2022 | Jan–Jun 2023 | Jul–Dec 2023 |
+  | H1 | Jan–Jun 2022 (181 days) | Jul–Dec 2022 (184) | Jan–Jun 2023 (181) |
+  | H2 | Jul–Dec 2022 (184) | Jan–Jun 2023 (181) | Jul–Dec 2023 (184) |
+
+  "Test" means the days the test forecasts start on, one forecast per day (`CHUNKS` in the script). The last
+  forecast runs 6 days past the test period, so each chunk's data extends 6 days beyond it. If a region's data stops
+  too early, the script ends the test period at the last day the data supports and prints a warning. AECI's H2 test
+  period ends on Dec 28, because its emissions end on 2024-01-03 and its last forecast block is from 2023-12-28.
 
   Training windows slide by 1 hour with 24 h labels (`manipulateTrainingDataShape`, `:474-508`). A `ModelCheckpoint`
   on validation MSE picks the model (`:571-580`). `EPOCH` is 10 and early-stopping patience is also 10, so early
@@ -103,7 +108,7 @@ Tier 1 works the same way, with source generation in place of CI.
 |---|---|---|
 | Forecast setup | 168 h from an origin, using forecast weather | **same** |
 | What is forecast | each source, then combined into CI by emission-factor formula | tier 1: each source. Tier 2: **CI directly**, learned with source forecasts as inputs; no combine formula |
-| Fitting frequency | refitted for **every forecast date** on the previous 504 h | trained **once per 6-month chunk** (~180 days), then reused for 180 test days |
+| Fitting frequency | refitted for **every forecast date** on the previous 504 h | trained **once per 6-month chunk** (181 or 184 days), then reused for 181–184 test days |
 | Parameters | 11 interpretable ones | about 17k weights (tier 2); about 9.8k per fossil source and 15.8k per renewable source (tier 1); stochastic training |
 | "Best fit" | a unique MLE that the optimizer converges to | a checkpoint picked by validation loss; a different seed gives a different model |
 | Memory | Kalman state summarises the whole history | only sees the last 24 h window |
@@ -115,8 +120,8 @@ Tier 1 works the same way, with source generation in place of CI.
 
 - **The objective/constraint form transfers fine.** Maximise practice concordance subject to an accuracy floor on the
   training loss (`CONCORDANCE_INTEGRATION.md`, section 4).
-- **"Practice windows" means something different.** SARIMAX had 4 windows inside a 3-week fit. CarbonCast has about
-  173 daily windows across a 6-month training period, and the weights they produce must work for the next 6 months of
+- **"Practice windows" means something different.** SARIMAX had 4 windows inside a 3-week fit. CarbonCast has
+  174–177 daily windows across a 6-month training period, and the weights they produce must work for the next 6 months of
   tests. The carry-over question is seasonal, not next-week.
 - **Tier 2 is where CI ranking lives.** The SARIMAX finding that per-source gains didn't reach the CI ranking may not
   apply here, because there's no combine step between the optimised model and the CI forecast.
