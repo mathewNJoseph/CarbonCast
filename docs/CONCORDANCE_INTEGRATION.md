@@ -78,8 +78,8 @@ for exactly its own hours (checked on the AECI data). Before them, that held for
    `select_forecast_blocks` in `run_6month_forecasting.py` now keeps whole blocks in file order. It keeps blocks
    issued from the chunk's first day through its last day minus `BUFFER_HOURS // 24` days, which is one block per
    data day as `splitWeatherDataset` and both rollouts assume. At the 168 h horizon that is 6 days. Both
-   `PREDICTION_WINDOW_HOURS` and `MAX_PREDICTION_WINDOW_HOURS` are read from the config. It raises an error if the file has a missing day or a broken block,
-   for example after the weather aggregation drops a cycle.
+   `PREDICTION_WINDOW_HOURS` and `MAX_PREDICTION_WINDOW_HOURS` are read from the config. It raises an error if the
+   file has a missing day or a broken block, for example after the weather aggregation drops a cycle.
 3. **Which day's weather is paired with which input (not a bug).** In both training and the rollout, block *b* is the
    forecast issued on data day *b*, and step *j* uses block rows `j*24 : j*24+24`. Those rows cover the *history*
    window's hours, not the day being predicted. This is consistent between train and test, so the practice rollout has
