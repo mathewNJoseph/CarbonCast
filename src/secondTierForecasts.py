@@ -497,9 +497,9 @@ def manipulateTrainingDataShape(data, trainWindowHours, labelWindowHours, weathe
         hourIdx +=1
         if(hourIdx == 24):
             hourIdx = 0
-            # For 168h rolling forecasts, move to next day's forecast window
-            # Each day starts a new 168h window, so skip by forecast stride (24h for daily forecasts)
-            weatherIdx += 23  # Skip to next day's start (24h stride - 1 for the increment)
+            # The weather file holds one MAX_PREDICTION_WINDOW_HOURS-row block per day, so
+            # after 24 one-row steps, jump the rest of the way to the next day's block.
+            weatherIdx += (MAX_PREDICTION_WINDOW_HOURS-24)
         y.append(data[trainWindow:labelWindow, DEPENDENT_VARIABLE_COL])
     X = np.array(X, dtype=np.float64)
     y = np.array(y, dtype=np.float64)
