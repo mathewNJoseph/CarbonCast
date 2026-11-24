@@ -196,11 +196,43 @@ def _gridOf(dataset):
     return lat, lon, cellArea, np.sum(cellArea)
 
 
+def reportMissingCycles(name, writtenLabels, yearList=YEARS):
+    """Print how many init cycles made it into a CSV, and list every one that did not.
+
+    A cycle dropped by buildDateGroups or skipped while reading is an ABSENT
+    row, not a blank one, so anything reading the CSV must not assume one row
+    per day. Consecutive missing cycles are printed as one range.
+    """
+    expected = [str(year) + f"{month:02d}" + f"{day:02d}" + hr
+                for year in yearList
+                for month in range(1, 13)
+                for day in range(1, monthrange(year, month)[1] + 1)
+                for hr in HOUR]
+
+    runs, start, prev = [], None, None
+    for label in expected:
+        if label in writtenLabels:
+            if start is not None:
+                runs.append((start, prev))
+                start = None
+        else:
+            start = start or label
+            prev = label
+    if start is not None:
+        runs.append((start, prev))
+
+    numMissing = len(expected) - len(writtenLabels)
+    print("    %s: wrote %d of %d cycles, %d missing"
+          % (name, len(writtenLabels), len(expected), numMissing))
+    if runs:
+        print("      missing: " + ", ".join(a if a == b else "%s-%s" % (a, b) for a, b in runs))
+
+
 def getWeatherData(dateGroups, csvFields, outFileName, weatherVariable):
     with open(outFileName, 'w') as csvfile:
         csvwriter = csv.writer(csvfile)
         csvwriter.writerow(csvFields)
-    rows = []
+    rows, written = [], set()
     pairedVar = weatherVariable in ("TEMP", "DPT")
 
     for label, dateFiles in dateGroups:
@@ -246,10 +278,12 @@ def getWeatherData(dateGroups, csvFields, outFileName, weatherVariable):
             print("    SKIP %s %s -- %s" % (weatherVariable, label, failed or "no data"))
         else:
             rows.append(row)
+            written.add(label)
 
     with open(outFileName, 'a') as csvfile:
         csvwriter = csv.writer(csvfile)
         csvwriter.writerows(rows)
+    reportMissingCycles(weatherVariable, written)
     return
 
 
@@ -257,7 +291,7 @@ def getWindData(dateGroups, csvFields, outFileName):
     with open(outFileName, 'w') as csvfile:
         csvwriter = csv.writer(csvfile)
         csvwriter.writerow(csvFields)
-    rows = []
+    rows, written = [], set()
 
     for label, dateFiles in dateGroups:
         row = None
@@ -299,10 +333,12 @@ def getWindData(dateGroups, csvFields, outFileName):
             print("    SKIP WIND %s -- %s" % (label, failed or "no data"))
         else:
             rows.append(row)
+            written.add(label)
 
     with open(outFileName, 'a') as csvfile:
         csvwriter = csv.writer(csvfile)
         csvwriter.writerows(rows)
+    reportMissingCycles("WIND", written)
     return
 
 
