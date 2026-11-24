@@ -61,6 +61,40 @@ def create_chunk_config(base_config_path, chunk_type, output_config_path):
     print(f"Created {chunk_type} config file: {output_config_path}")
     return config
 
+# Rows per issue in <region>_168hr_forecasts_DA.csv: one 7-day forecast per day.
+FORECAST_BLOCK_HOURS = 168
+
+def select_forecast_blocks(forecasts_df, start_date, end_date):
+    """
+    Keep the whole forecast blocks issued from start_date up to the last day
+    whose 7-day horizon still ends by end_date, in file order.
+
+    The forecasts file is one 168-row block per issue day, and the blocks
+    overlap: each hour appears in up to 7 of them. secondTierForecasts splits
+    the file by row count and pairs block b with day b of the emissions chunk,
+    which needs the blocks whole, in issue order, one per day, and numbering
+    (days in chunk) - 6. Sorting or slicing by row timestamp breaks all four.
+    """
+    num_blocks, leftover = divmod(len(forecasts_df), FORECAST_BLOCK_HOURS)
+    if leftover:
+        raise ValueError(f"Forecast file has {len(forecasts_df)} rows, not a "
+                         f"multiple of {FORECAST_BLOCK_HOURS}")
+    row_times = forecasts_df.index.values.reshape(num_blocks, FORECAST_BLOCK_HOURS)
+    issue_dates = pd.DatetimeIndex(row_times[:, 0])
+    offsets = row_times - row_times[:, :1]
+    if not (offsets == pd.timedelta_range(0, periods=FORECAST_BLOCK_HOURS, freq="h").values).all():
+        raise ValueError("Forecast file blocks are not 168 consecutive hours from their issue time")
+
+    first = pd.Timestamp(start_date)
+    last = pd.Timestamp(end_date).normalize() - pd.Timedelta(hours=FORECAST_BLOCK_HOURS - 24)
+    keep = (issue_dates >= first) & (issue_dates <= last)
+    expected = pd.date_range(first, last, freq="D")
+    if not issue_dates[keep].equals(expected):
+        missing = expected.difference(issue_dates[keep])
+        raise ValueError(f"Forecast blocks for {first.date()}..{last.date()} are not one per day "
+                         f"in order; {len(missing)} missing, e.g. {list(missing[:5].date)}")
+    return forecasts_df.iloc[keep.repeat(FORECAST_BLOCK_HOURS)]
+
 def modify_data_for_chunk(chunk_type, region):
     """
     Modify the data files to implement the specific date ranges for each chunk.
@@ -89,11 +123,11 @@ def modify_data_for_chunk(chunk_type, region):
     lifecycle_df = pd.read_csv(lifecycle_emissions_path, parse_dates=['UTC time'], index_col=['UTC time'])
     forecasts_df = pd.read_csv(forecasts_path, parse_dates=['datetime'], index_col=['datetime'])
     
-    # Sort by index to ensure monotonic datetime index
+    # Sort by index to ensure monotonic datetime index. The forecasts file is
+    # deliberately NOT sorted: see select_forecast_blocks.
     direct_df = direct_df.sort_index()
     lifecycle_df = lifecycle_df.sort_index()
-    forecasts_df = forecasts_df.sort_index()
-    
+
     if chunk_type == "H1":
         # H1: Need data from Jan 2022 to Jun 2023 (18 months)
         # This ensures: Train (Jan-Jun 2022) + Val (Jul-Dec 2022) + Test (Jan-Jun 2023)
@@ -108,7 +142,7 @@ def modify_data_for_chunk(chunk_type, region):
     # Filter datasets by date range
     direct_chunk = direct_df[start_date:end_date]
     lifecycle_chunk = lifecycle_df[start_date:end_date]
-    forecasts_chunk = forecasts_df[start_date:end_date]
+    forecasts_chunk = select_forecast_blocks(forecasts_df, start_date, end_date)
     
     # Save temporary chunk files
     chunk_dir = f"data/{region}/temp_{chunk_type}"
