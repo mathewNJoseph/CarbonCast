@@ -1,8 +1,9 @@
 # Tier 2 concordance: detailed design
 
-Status: **design only; no code changed.** Line numbers refer to the `CarbonCast-v3.2` branch as of 2026-11-24
-(commit `801f1439fbf`). This expands `CONCORDANCE_INTEGRATION.md` sections 4–6 for the second tier (the CNN-LSTM
-that forecasts carbon intensity) only. For background on the two tiers, see `HOW_CARBONCAST_WORKS.md`.
+Status: **design; implementation started** (`src/concordance_tier2.py` has `smooth_c`). Line numbers refer to the
+`CarbonCast-v3.2` branch as of 2026-11-24 (commit `801f1439fbf`). This expands `CONCORDANCE_INTEGRATION.md` sections
+4–6 for the second tier (the CNN-LSTM that forecasts carbon intensity) only. For background on the two tiers, see
+`HOW_CARBONCAST_WORKS.md`.
 
 ## 0. How it makes the model more concordant
 
@@ -166,26 +167,20 @@ So C_A also sees better weather than test does. That is a second reason to measu
 
 ## 4. The smooth c-index in TF
 
-This is a port of `CarbonCast-SARIMAX-mat/src_clean/concordance_impl/concordance.py` (`smooth_concordance`).
+Implemented as `smooth_c(forecasts, actuals, tau)` in `src/concordance_tier2.py` (done). It is a port of
+`smooth_concordance` in `CarbonCast-SARIMAX-mat/src_clean/concordance_impl/concordance.py`, batched over windows:
+for each pair of hours whose actuals differ, `sigmoid(sign(a_j − a_i) · (f_j − f_i) / (tau · std(f)))`, averaged
+over the pairs in a window and then over windows.
 
-```python
-I, J = np.triu_indices(168, 1)
-
-def smooth_c(F, A_act, tau=0.1):
-    s    = np.sign(A_act[:, J] - A_act[:, I])                       # constants
-    keep = (s != 0)                                                  # ties in the actuals dropped
-    dF   = tf.gather(F, J, axis=1) - tf.gather(F, I, axis=1)
-    sd   = tf.math.reduce_std(F, axis=1, keepdims=True)              # ddof=0, same as np.std
-    p    = tf.sigmoid(s * dF / (tau * sd))
-    per_window = tf.reduce_sum(p * keep, 1) / keep.sum(1)
-    return tf.reduce_mean(per_window)                                # mean over windows, as in SARIMAX
-```
-
-- **Scaling does not matter.** Min-max scaling (`common.py:75`) is monotone and `sd` cancels the forecast's scale,
+- **Scaling does not matter.** Min-max scaling (`common.py:75`) is monotone and `std(f)` cancels the forecast's scale,
   so C can be computed on scaled values.
-- **`sd` stays inside the graph,** so the optimizer cannot raise C by stretching the forecast.
-- **Drop flat windows.** Windows with no untied pairs should be excluded (SARIMAX returns NaN for them).
-- **Verify the port.** Check every window against the numpy `smooth_concordance` to 1e-9 before using it.
+- **`std(f)` stays inside the graph,** so the optimizer cannot raise C by stretching the forecast.
+- **Flat windows are skipped.** Windows whose actuals have std below 1e-6 are left out of the mean, as SARIMAX's
+  `scored` mask does.
+- **A constant forecast scores 0.5,** as in the numpy version, instead of dividing by a zero std.
+- **The port is verified** (`tests/test_concordance_tier2.py`). It matches the numpy version to 1e-9 per window and
+  over windows, including tied actuals, a flat window and a constant forecast. Its gradient matches finite
+  differences of the numpy version.
 - **Memory:** W × 14,028 pairs ≈ 2.5M values, which fits easily. For C_24, use `triu_indices(24, 1)` and the 180–183 daily
   samples.
 
@@ -328,7 +323,7 @@ only to measure each variant and to choose eps, never inside the solver.
 
 1. **Fix the two alignment bugs (done).** Both are fixed, and every training, validation and test input now gets
    weather for its own hours. Re-check this after any change to the weather data or the chunk dates.
-2. **Port `smooth_c`** and test it against the numpy version.
+2. **Port `smooth_c`** and test it against the numpy version (done).
 3. **Headroom check on the baseline.** Compute C_24, C_A and C_B on train and val, plus the hard (lifelines) c-index
    of the real test rollouts. A large C_A–C_B gap means C_A is not a safe stand-in for the test rollout.
 4. **Output-layer SLSQP with C_A** (variant A) over the eps grid. This should take minutes per chunk.
