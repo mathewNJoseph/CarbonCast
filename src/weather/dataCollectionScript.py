@@ -8,6 +8,7 @@ These functions aggregate the weather data over a specified bounding box.
 
 
 import subprocess
+import sys
 from collections import namedtuple
 from calendar import monthrange
 import os.path
@@ -16,13 +17,41 @@ import csv
 import math
 import numpy as np
 
-ISO_LIST = ["AUS_QLD"]
+# Regions named on the command line override this list. That is how one region
+# gets processed on its own for a test, and how a full run gets sharded across
+# several pods without editing code.
+ISO_LIST = sys.argv[1:] or ["AECI", "AT", "AZPS", "BE", "BG", "BPAT", "CH", "CISO", "CZ", "DE",
+            "DK", "DUK", "EE", "EPE", "ERCOT", "ES", "FI", "FPL", "FR", "GR",
+            "HR", "HU", "IPCO", "ISNE", "IT", "LDWP", "LT", "LV", "MISO", "NEVP",
+            "NL", "NWMT", "NYISO", "PACE", "PACW", "PJM", "PL", "PSCO", "PT", "RS",
+            "SC", "SCEG", "SE", "SI", "SK", "SOCO", "SPA", "SRP", "SWPP", "TIDC",
+            "TVA"]
 # IF 2 CONSECUTIVE FILES ARE NOT PRESENT, MANUALLY ADD THEM
 
-GRIB2_CMD = "grib2/wgrib2/wgrib2"
+# Plain name, not a relative build path: the CarbonCast README installs the
+# binary with `cp -rfv wgrib2/wgrib2 /usr/local/bin/wgrib2`, and the
+# weather_download image puts it on PATH via conda-forge.
+#
+# -inv /dev/null discards wgrib2's inventory listing, which it otherwise writes
+# to stdout on every single call. That is ~2 lines x 206,590 calls per region --
+# enough to bury the "doesn't exist" warnings that matter and to blow through a
+# Kubernetes node's log rotation. The flag must precede the filename, and the
+# CSV it produces is byte-identical either way.
+GRIB2_CMD = "wgrib2 -inv /dev/null"
 # FILE_DIR = "gfs.0p25.2020010100-2021010100.f000.grib2/"
 
 FILE_PREFIX = "gfs.0p25."
+# Where <REGION>/<var>/*.grib2 live. The default is the weather-data PVC, which
+# k8s/tar-job.yaml and k8s/debug-pod.yaml mount whole at /data; the download Job
+# instead mounts just the retraining_archive subPath at /app/retraining_archive.
+#
+# Overridable because reading the GRIB2 files straight off CephFS is ruinous:
+# each is only ~4.3 KB, every one is read exactly once so nothing caches, and
+# the measured cost was 1.58 s per file against 5.3 ms on local disk -- 300x,
+# and 206,590 files per region. scripts/aggregate_weather.sh therefore unpacks
+# the tars onto node-local scratch and points this at that instead, turning
+# 206,590 small CephFS reads into 32 large sequential ones.
+ARCHIVE_ROOT = os.environ.get("WEATHER_ARCHIVE_ROOT", "/data/retraining_archive")
 UGRD_VGRD_SEPRATOR = {"CISO": 1886, "PJM": 2556, "SE": 2296, "DK-DK2": 221, 
                         "ERCO": 2116, "ISNE": 1056, "GB": 1978, "DE": 1254, 
                         "PL": 984, "AUS_NSW": 64, "AUS_QLD": 5695, "AUS_SA": 2809}
@@ -31,37 +60,21 @@ TMP_DPT_SEPARATOR = {"CISO": 1886, "PJM": 2556, "SE": 2296, "DK-DK2": 221,
                         "PL": 984, "AUS_NSW": 64, "AUS_QLD": 5695, "AUS_SA": 2809}
 
 HOUR = ["00"] ##, "06", "12", "18"]
-FCST = ["000", "003", "006", "009", "012", "015", "018", "021", "024",
-                "027", "030", "033", "036", "039", "042", "045", "048",
-                "051", "054", "057", "060", "063", "066", "069", "072",
-                "075", "078", "081", "084", "087", "090", "093", "096"]
-FCST_AVG_ACC = ["003", "006", "009", "012", "015", "018", "021", "024",
-                "027", "030", "033", "036", "039", "042", "045", "048",
-                "051", "054", "057", "060", "063", "066", "069", "072",
-                "075", "078", "081", "084", "087", "090", "093", "096"]
-YEARS = [2019, 2020, 2021]
+MAX_FCST_HOUR = 168 # was 96
+FCST = ["000"] + ["%03d" % h for h in range(3, MAX_FCST_HOUR+1, 3)]
+FCST_AVG_ACC = ["%03d" % h for h in range(3, MAX_FCST_HOUR+1, 3)]
+YEARS = [2022, 2023]
 HEADER = ["startDate", "endDate", "param", "level", "longitude", "latitude", "value"]
-CSV_FILE_FIELDS_FCST = ["datetime", "param", "level", "latitude", "longitude", "Analysis", "3 hr fcst", 
-        "6 hr fcst", "9 hr fcst", "12 hr fcst", "15 hr fcst", "18 hr fcst",
-        "21 hr fcst", "24 hr fcst", "27 hr fcst", "30 hr fcst", "33 hr fcst",
-        "36 hr fcst", "39 hr fcst", "42 hr fcst", "45 hr fcst", "48 hr fcst",
-        "51 hr fcst", "54 hr fcst", "57 hr fcst", "60 hr fcst", "63 hr fcst",
-        "66 hr fcst", "69 hr fcst", "72 hr fcst", "75 hr fcst", "78 hr fcst",
-        "81 hr fcst", "84 hr fcst", "87 hr fcst", "90 hr fcst", "93 hr fcst", "96 hr fcst"]
-CSV_FILE_FIELDS_AVG = ["datetime", "param", "level", "latitude", "longitude", "0-3 hr avg", 
-        "0-6 hr avg", "6-9 hr avg", "6-12 hr avg", "12-15 hr avg", "12-18 hr avg",
-        "18-21 hr avg", "18-24 hr avg", "24-27 hr avg", "24-30 hr avg", "30-33 hr avg",
-        "30-36 hr avg", "36-39 hr avg", "36-42 hr avg", "42-45 hr avg", "42-48 hr avg",
-        "48-51 hr avg", "48-54 hr avg", "54-57 hr avg", "54-60 hr avg", "60-63 hr avg",
-        "60-66 hr avg", "66-69 hr avg", "66-72 hr avg", "72-75 hr avg", "72-78 hr avg",
-        "78-81 hr avg", "78-84 hr avg", "84-87 hr avg", "84-90 hr avg", "90-93 hr avg", "90-96 hr avg"] 
-CSV_FILE_FIELDS_ACC = ["datetime", "param", "level", "latitude", "longitude", "0-3 hr acc", 
-        "0-6 hr acc", "6-9 hr acc", "6-12 hr acc", "12-15 hr acc", "12-18 hr acc",
-        "18-21 hr acc", "18-24 hr acc", "24-27 hr acc", "24-30 hr acc", "30-33 hr acc",
-        "30-36 hr acc", "36-39 hr acc", "36-42 hr acc", "42-45 hr acc", "42-48 hr acc",
-        "48-51 hr acc", "48-54 hr acc", "54-57 hr acc", "54-60 hr acc", "60-63 hr acc",
-        "60-66 hr acc", "66-69 hr acc", "66-72 hr acc", "72-75 hr acc", "72-78 hr acc",
-        "78-81 hr acc", "78-84 hr acc", "84-87 hr acc", "84-90 hr acc", "90-93 hr acc", "90-96 hr acc"] 
+CSV_FILE_FIELDS_FCST = ["datetime", "param", "level", "latitude", "longitude",
+        "Analysis"] + ["%d hr fcst" % h for h in range(3, MAX_FCST_HOUR+1, 3)]
+# ds084.1 returns averages/accumulations as a (3-hour, 6-hour) pair per 6-hour
+# block -- 0-3, 0-6, 6-9, 6-12, ... -- and that is the order they are stored in.
+CSV_FILE_FIELDS_AVG = ["datetime", "param", "level", "latitude", "longitude"] + [
+        lbl for s in range(0, MAX_FCST_HOUR, 6)
+        for lbl in ("%d-%d hr avg" % (s, s+3), "%d-%d hr avg" % (s, s+6))]
+CSV_FILE_FIELDS_ACC = ["datetime", "param", "level", "latitude", "longitude"] + [
+        lbl for s in range(0, MAX_FCST_HOUR, 6)
+        for lbl in ("%d-%d hr acc" % (s, s+3), "%d-%d hr acc" % (s, s+6))]
 
 def getFileList(yearList=[2020], fileDir = None, fcstCol=FCST):
     fileList = []
@@ -91,119 +104,206 @@ def getFileList(yearList=[2020], fileDir = None, fcstCol=FCST):
                             prevFile = fileName # assuming the first file to be searched is always present
     return fileList
 
-def getWeatherData(fileList, csvFields, outFileName, fcstCol, weatherVariable):
-    with open(outFileName, 'w') as csvfile: 
-        # creating a csv writer object 
-        csvwriter = csv.writer(csvfile)                    
-        # writing the fields 
-        csvwriter.writerow(csvFields)
-    fileIdx = 0
-    rows = []
-    while fileIdx < len(fileList):
-        row = None
-        lat = None
-        lon = None
-        # weatherValues = []
-        for i in range(len(fcstCol)):
-            val = subprocess.call(GRIB2_CMD + " " + fileList[fileIdx] + " -csv tmp.csv", shell=True)
-            fileIdx+=1
-            if(val == 0):
-                dataset = pd.read_csv("tmp.csv", infer_datetime_format=True, 
-                        names=HEADER) #, header=0,  parse_dates=['UTC time'], index_col=['UTC time'])    
-                # print(dataset.head(2))
-                if (weatherVariable == "TEMP"):
-                    dataset = dataset[:TMP_DPT_SEPARATOR[ISO]]
-                elif (weatherVariable == "DPT"):
-                    dataset = dataset[TMP_DPT_SEPARATOR[ISO]:]
-                if (i==0):
-                    lat = np.unique(dataset["latitude"].values)
-                    lon = np.unique(dataset["longitude"].values)
-                    grid_cell_area = area_grid(lat, lon)
-                    total_area_of_earth = np.sum(grid_cell_area)
-                # averageValue = round(dataset["value"].mean(), 5)
-                
-                if row is None:
-                    row = [dataset["startDate"].iloc[0], dataset["param"].iloc[0], dataset["level"].iloc[0],
-                                dataset["latitude"].iloc[0], dataset["longitude"].iloc[0]]
+# A cycle may borrow at most this many forecast hours from earlier in the SAME
+# cycle before it is dropped instead. Six steps is 18 hours of a 168-hour
+# horizon; past that the row is mostly synthetic, and a visible gap beats a
+# plausible fabrication.
+MAX_SUBSTITUTED_PER_CYCLE = 6
 
-                value = dataset["value"].values
-                # weighted_mean = np.mean(temperature)
-                value = np.reshape(value, (len(lat), len(lon)))
-                weighted_mean = (value * grid_cell_area) / total_area_of_earth
-                weighted_mean = np.sum(weighted_mean)
-                row.append(weighted_mean)
-                delFile = subprocess.call("rm tmp.csv", shell=True)
-                if(delFile != 0):
-                    print("Error: Process call failed -- rm")
-            else:
-                print("Error: Process call failed -- ", GRIB2_CMD)
-        # writing to csv file
-        # print(weatherValues)
-        # row.extend(weatherValues) 
-        rows.append(row)
+
+def buildDateGroups(fileDir, fcstCol, yearList=YEARS):
+    """Expected GRIB2 paths grouped by init cycle, in forecast-hour order.
+
+    Returns [(YYYYMMDDHH, [path, ...]), ...]. A cycle missing a forecast hour
+    reuses the nearest earlier hour FROM THE SAME CYCLE, so a gap costs a few
+    hours of staleness rather than a missing day.
+
+    Two things this does that getFileList() below does not.
+
+    First, paths are built from fcstCol directly, so position i can only ever
+    hold forecast hour fcstCol[i]. getFileList returns one flat list that the
+    caller slices len(fcstCol) at a time, and when its fallback cannot find a
+    substitute it appends nothing at all -- leaving the list short, so every
+    later cycle silently pairs the wrong forecast hour with the wrong day for
+    the rest of the run.
+
+    Second, substitution never crosses a cycle boundary. getFileList carries
+    its `prevFile` across days, so a missing f000 is filled with YESTERDAY's
+    last forecast hour -- a day-old value in the analysis slot, which is the
+    present-time field. Here a cycle with nothing earlier to borrow from is
+    dropped instead, as is one needing more than MAX_SUBSTITUTED_PER_CYCLE
+    substitutions.
+    """
+    groups = []
+    filled = []
+    dropped = []
+
+    for year in yearList:
+        for month in range(1, 13):
+            for day in range(1, monthrange(year, month)[1] + 1):
+                curDate = str(year) + f"{month:02d}" + f"{day:02d}"
+                for hr in HOUR:
+                    label = curDate + hr
+                    paths, subs, lastGood, reason = [], [], None, None
+
+                    for fcst in fcstCol:
+                        path = os.path.join(fileDir, "%s%s%s.f%s.grib2"
+                                            % (FILE_PREFIX, curDate, hr, fcst))
+                        if os.path.exists(path):
+                            lastGood = path
+                            paths.append(path)
+                        elif lastGood is None:
+                            reason = ("f%s missing with nothing earlier in the "
+                                      "cycle to substitute" % fcst)
+                            break
+                        else:
+                            subs.append((fcst, os.path.basename(lastGood).split(".f")[1][:3]))
+                            paths.append(lastGood)
+
+                    if reason is None and len(subs) > MAX_SUBSTITUTED_PER_CYCLE:
+                        reason = ("%d of %d files missing, over the substitution "
+                                  "cap of %d" % (len(subs), len(fcstCol),
+                                                 MAX_SUBSTITUTED_PER_CYCLE))
+                    if reason is not None:
+                        dropped.append((label, reason))
+                        continue
+                    if subs:
+                        filled.append((label, subs))
+                    groups.append((label, paths))
+
+    if filled:
+        print("    %d cycle(s) completed by substitution (%d file(s)):"
+              % (len(filled), sum(len(sub) for _, sub in filled)))
+        for label, sub in filled[:5]:
+            print("      %s  %s" % (label, ", ".join("f%s<-f%s" % (a, b) for a, b in sub)))
+        if len(filled) > 5:
+            print("      ... and %d more" % (len(filled) - 5))
+    if dropped:
+        print("    %d cycle(s) DROPPED:" % len(dropped))
+        for label, reason in dropped[:5]:
+            print("      %s  %s" % (label, reason))
+        if len(dropped) > 5:
+            print("      ... and %d more" % (len(dropped) - 5))
+    return groups
+
+
+def _gridOf(dataset):
+    """Unique latitudes and longitudes, and the cell-area weights over them."""
+    lat = np.unique(dataset["latitude"].values)
+    lon = np.unique(dataset["longitude"].values)
+    cellArea = area_grid(lat, lon)
+    return lat, lon, cellArea, np.sum(cellArea)
+
+
+def getWeatherData(dateGroups, csvFields, outFileName, fcstCol, weatherVariable):
+    with open(outFileName, 'w') as csvfile:
+        csvwriter = csv.writer(csvfile)
+        csvwriter.writerow(csvFields)
+    rows = []
+    pairedVar = weatherVariable in ("TEMP", "DPT")
+
+    for label, dateFiles in dateGroups:
+        row = None
+        lat = lon = cellArea = totalArea = gridSize = None
+        failed = None
+
+        for i in range(len(dateFiles)):
+            val = subprocess.call(GRIB2_CMD + " " + dateFiles[i] + " -csv tmp.csv", shell=True)
+            if val != 0:
+                failed = "wgrib2 exited %d on %s" % (val, dateFiles[i])
+                break
+            dataset = pd.read_csv("tmp.csv", names=HEADER)
+            os.remove("tmp.csv")
+
+            if i == 0:
+                lat, lon, cellArea, totalArea = _gridOf(dataset)
+                gridSize = len(lat) * len(lon)
+
+            # TMP/DPT and U/V arrive as two params over one grid, so a paired
+            # file holds exactly twice the grid. Anything else means the file
+            # is truncated or was subset differently, and its cycle is dropped
+            # rather than contributing a short row.
+            expected = gridSize * 2 if pairedVar else gridSize
+            if len(dataset) != expected:
+                failed = "%s: expected %d rows, got %d" % (dateFiles[i], expected, len(dataset))
+                break
+
+            if weatherVariable == "TEMP":
+                dataset = dataset[:gridSize]
+            elif weatherVariable == "DPT":
+                dataset = dataset[gridSize:2 * gridSize]
+
+            if row is None:
+                row = [dataset["startDate"].iloc[0], dataset["param"].iloc[0],
+                       dataset["level"].iloc[0], dataset["latitude"].iloc[0],
+                       dataset["longitude"].iloc[0]]
+
+            value = np.reshape(dataset["value"].values, (len(lat), len(lon)))
+            row.append(np.sum((value * cellArea) / totalArea))
+
+        if failed is not None or row is None:
+            print("    SKIP %s %s -- %s" % (weatherVariable, label, failed or "no data"))
+        else:
+            rows.append(row)
+
     with open(outFileName, 'a') as csvfile:
         csvwriter = csv.writer(csvfile)
         csvwriter.writerows(rows)
-
     return
 
-def getWindData(fileList, csvFields, outFileName):
-    # print(len(fileList))
-    # exit(0)
-    with open(outFileName, 'w') as csvfile: 
-        # creating a csv writer object 
-        csvwriter = csv.writer(csvfile)                    
-        # writing the fields 
-        csvwriter.writerow(csvFields)
-    fileIdx = 0
-    rows = []
-    
-    while fileIdx < len(fileList):
-        row = None
-        lat = None
-        lon = None
-        grid_cell_area = None
-        total_area_of_earth = None
-        # weatherValues = []
-        for i in range(len(FCST)):
-            val = subprocess.call(GRIB2_CMD + " " + fileList[fileIdx] + " -csv tmp.csv", shell=True)
-            fileIdx+=1
-            if(val == 0):
-                dataset = pd.read_csv("tmp.csv", infer_datetime_format=True, 
-                        names=HEADER) #, header=0,  parse_dates=['UTC time'], index_col=['UTC time'])    
-                # print(dataset.head(2))
-                vdataset = dataset[UGRD_VGRD_SEPRATOR[ISO]:]
-                udataset = dataset[:UGRD_VGRD_SEPRATOR[ISO]]
-                if (i==0):
-                    lat = np.unique(dataset["latitude"].values)
-                    lon = np.unique(dataset["longitude"].values)
-                    grid_cell_area = area_grid(lat, lon)
-                    total_area_of_earth = np.sum(grid_cell_area)
-                if row is None:
-                    row = [dataset["startDate"].iloc[0], dataset["param"].iloc[0], dataset["level"].iloc[0],
-                                dataset["latitude"].iloc[0], dataset["longitude"].iloc[0]]
 
-                windSpeed = (udataset["value"].values**2 + vdataset["value"].values**2)**(0.5)
-                # weighted_mean = np.mean(temperature)
-                value = np.reshape(windSpeed, (len(lat), len(lon)))
-                weighted_mean = (value * grid_cell_area) / total_area_of_earth
-                weighted_mean = np.sum(weighted_mean)
-                row.append(weighted_mean)
-                
-                delFile = subprocess.call("rm tmp.csv", shell=True)
-                if(delFile != 0):
-                    print("Error: Process call failed -- rm")
-            else:
-                print("Error: Process call failed -- ", GRIB2_CMD)
-        # writing to csv file
-        # print(weatherValues)
-        # row.extend(weatherValues) 
-        rows.append(row)
+def getWindData(dateGroups, csvFields, outFileName, fcstCol=FCST):
+    with open(outFileName, 'w') as csvfile:
+        csvwriter = csv.writer(csvfile)
+        csvwriter.writerow(csvFields)
+    rows = []
+
+    for label, dateFiles in dateGroups:
+        row = None
+        lat = lon = cellArea = totalArea = gridSize = None
+        failed = None
+
+        for i in range(len(dateFiles)):
+            val = subprocess.call(GRIB2_CMD + " " + dateFiles[i] + " -csv tmp.csv", shell=True)
+            if val != 0:
+                failed = "wgrib2 exited %d on %s" % (val, dateFiles[i])
+                break
+            dataset = pd.read_csv("tmp.csv", names=HEADER)
+            os.remove("tmp.csv")
+
+            if i == 0:
+                lat, lon, cellArea, totalArea = _gridOf(dataset)
+                gridSize = len(lat) * len(lon)
+
+            if len(dataset) != gridSize * 2:
+                failed = "%s: expected %d rows, got %d" % (
+                    dateFiles[i], gridSize * 2, len(dataset))
+                break
+
+            # U GRD first, V GRD second -- confirmed against the GRIB2 section 4
+            # parameter numbers and against wgrib2 -csv output on the archive.
+            udataset = dataset[:gridSize]
+            vdataset = dataset[gridSize:2 * gridSize]
+
+            if row is None:
+                row = [dataset["startDate"].iloc[0], dataset["param"].iloc[0],
+                       dataset["level"].iloc[0], dataset["latitude"].iloc[0],
+                       dataset["longitude"].iloc[0]]
+
+            windSpeed = (udataset["value"].values**2 + vdataset["value"].values**2)**(0.5)
+            value = np.reshape(windSpeed, (len(lat), len(lon)))
+            row.append(np.sum((value * cellArea) / totalArea))
+
+        if failed is not None or row is None:
+            print("    SKIP WIND %s -- %s" % (label, failed or "no data"))
+        else:
+            rows.append(row)
+
     with open(outFileName, 'a') as csvfile:
         csvwriter = csv.writer(csvfile)
         csvwriter.writerows(rows)
-
     return
+
 
 def addColumnToCSVFile(fileName, newColName, newColValue):
     dataset = pd.read_csv(fileName, header=0)
@@ -232,8 +332,7 @@ def getWindSpeedAcrossAllRegions(inFileName):
                 vval = 0 #subprocess.call(GRIB2_CMD + " " + vWindFileList[fileIdx] + " -csv vtmp.csv", shell=True)
                 fileIdx+=1
                 if (vval == 0):
-                    udataset = pd.read_csv("utmp.csv", infer_datetime_format=True, 
-                            names=HEADER)
+                    udataset = pd.read_csv("utmp.csv", names=HEADER)
                     # vdataset = pd.read_csv("vtmp.csv", infer_datetime_format=True, 
                     #         names=HEADER)
                     vdataset = udataset[UGRD_VGRD_SEPRATOR[ISO]:]
@@ -283,8 +382,7 @@ def getTotalDWSRFcrossAllRegions():
             uval = subprocess.call(GRIB2_CMD + " " + dswrfFileList[fileIdx] + " -csv utmp.csv", shell=True)
             if(uval == 0):
                 fileIdx+=1
-                udataset = pd.read_csv("utmp.csv", infer_datetime_format=True, 
-                        names=HEADER)
+                udataset = pd.read_csv("utmp.csv", names=HEADER)
                 totalWindSpeed = np.sum(udataset["value"].values)
                 avgWindSpeed = np.average(udataset["value"].values)
                 totalWindSpeedList.append([udataset["startDate"].iloc[0], totalWindSpeed])
@@ -356,7 +454,6 @@ def area_grid(lat, lon):
     https://github.com/chadagreene/CDT/blob/master/cdt/cdtarea.m
     """
     from numpy import meshgrid, deg2rad, gradient, cos
-    from xarray import DataArray
 
     xlon, ylat = meshgrid(lon, lat)
     # print(ylat)
@@ -393,17 +490,17 @@ for ISO in ISO_LIST:
     #                     "../final_weather_data/"+ISO+"/"+ISO+"_AVG_DSWRF.csv",
     #                     "../final_weather_data/"+ISO+"/"+ISO+"_AVG_PCP.csv"]
 
-    FILE_DIR = ["../extn/"+ISO+"/weather_data/ugrd_vgrd/",
-            "../extn/"+ISO+"/weather_data/tmp_dpt/",
-            "../extn/"+ISO+"/weather_data/tmp_dpt/",
-            "../extn/"+ISO+"/weather_data/dswrf/",
-            "../extn/"+ISO+"/weather_data/apcp/"]
+    FILE_DIR = [ARCHIVE_ROOT+"/"+ISO+"/wind/",
+            ARCHIVE_ROOT+"/"+ISO+"/temp/",
+            ARCHIVE_ROOT+"/"+ISO+"/temp/",
+            ARCHIVE_ROOT+"/"+ISO+"/dswrf/",
+            ARCHIVE_ROOT+"/"+ISO+"/rain/"]
 
-    OUT_FILE_NAME_LIST = ["../extn/"+ISO+"/weather_data/"+ISO+"_AVG_WIND_SPEED.csv",
-                        "../extn/"+ISO+"/weather_data/"+ISO+"_AVG_TEMP.csv",
-                        "../extn/"+ISO+"/weather_data/"+ISO+"_AVG_DPT.csv",
-                        "../extn/"+ISO+"/weather_data/"+ISO+"_AVG_DSWRF.csv",
-                        "../extn/"+ISO+"/weather_data/"+ISO+"_AVG_PCP.csv"]
+    OUT_FILE_NAME_LIST = [ARCHIVE_ROOT+"/"+ISO+"/"+ISO+"_AVG_WIND_SPEED.csv",
+                        ARCHIVE_ROOT+"/"+ISO+"/"+ISO+"_AVG_TEMP.csv",
+                        ARCHIVE_ROOT+"/"+ISO+"/"+ISO+"_AVG_DPT.csv",
+                        ARCHIVE_ROOT+"/"+ISO+"/"+ISO+"_AVG_DSWRF.csv",
+                        ARCHIVE_ROOT+"/"+ISO+"/"+ISO+"_AVG_PCP.csv"]
 
     # FILE_DIR = ["../extn/"+ISO+"/weather_data/tmp_dpt/",
     #         "../extn/"+ISO+"/weather_data/tmp_dpt/"]
@@ -414,25 +511,25 @@ for ISO in ISO_LIST:
     print("*******************", ISO, "*******************")
     for xx in range(len(OUT_FILE_NAME_LIST)):
         if ("WIND" in OUT_FILE_NAME_LIST[xx]):
-            fileList = getFileList(YEARS, FILE_DIR[xx], fcstCol=FCST)
             print("WIND: ", OUT_FILE_NAME_LIST[xx])
-            getWindData(fileList, CSV_FILE_FIELDS_FCST, OUT_FILE_NAME_LIST[xx])
+            groups = buildDateGroups(FILE_DIR[xx], FCST)
+            getWindData(groups, CSV_FILE_FIELDS_FCST, OUT_FILE_NAME_LIST[xx], FCST)
         else:
             if ("TEMP" in OUT_FILE_NAME_LIST[xx]):
-                fileList = getFileList(YEARS, FILE_DIR[xx], fcstCol=FCST)
                 print("TEMP: ", OUT_FILE_NAME_LIST[xx])
-                getWeatherData(fileList, CSV_FILE_FIELDS_FCST, OUT_FILE_NAME_LIST[xx], FCST, "TEMP")
+                groups = buildDateGroups(FILE_DIR[xx], FCST)
+                getWeatherData(groups, CSV_FILE_FIELDS_FCST, OUT_FILE_NAME_LIST[xx], FCST, "TEMP")
             elif ("DPT" in OUT_FILE_NAME_LIST[xx]):
-                fileList = getFileList(YEARS, FILE_DIR[xx], fcstCol=FCST)
                 print("DPT: ", OUT_FILE_NAME_LIST[xx])
-                getWeatherData(fileList, CSV_FILE_FIELDS_FCST, OUT_FILE_NAME_LIST[xx], FCST, "DPT")
+                groups = buildDateGroups(FILE_DIR[xx], FCST)
+                getWeatherData(groups, CSV_FILE_FIELDS_FCST, OUT_FILE_NAME_LIST[xx], FCST, "DPT")
             elif ("DSWRF" in OUT_FILE_NAME_LIST[xx]):
-                fileList = getFileList(YEARS, FILE_DIR[xx], fcstCol=FCST_AVG_ACC)
                 print("DSWRF: ", OUT_FILE_NAME_LIST[xx])
-                getWeatherData(fileList, CSV_FILE_FIELDS_AVG, OUT_FILE_NAME_LIST[xx], FCST_AVG_ACC, "DSWRF")
+                groups = buildDateGroups(FILE_DIR[xx], FCST_AVG_ACC)
+                getWeatherData(groups, CSV_FILE_FIELDS_AVG, OUT_FILE_NAME_LIST[xx], FCST_AVG_ACC, "DSWRF")
             elif ("PCP" in OUT_FILE_NAME_LIST[xx]):
-                fileList = getFileList(YEARS, FILE_DIR[xx], fcstCol=FCST_AVG_ACC)
                 print("PCP: ", OUT_FILE_NAME_LIST[xx])
-                getWeatherData(fileList, CSV_FILE_FIELDS_ACC, OUT_FILE_NAME_LIST[xx], FCST_AVG_ACC, "PCP")
+                groups = buildDateGroups(FILE_DIR[xx], FCST_AVG_ACC)
+                getWeatherData(groups, CSV_FILE_FIELDS_ACC, OUT_FILE_NAME_LIST[xx], FCST_AVG_ACC, "PCP")
     print("*******************", ISO, " done *******************")
 
