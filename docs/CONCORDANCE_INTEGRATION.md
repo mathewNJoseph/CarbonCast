@@ -75,9 +75,10 @@ for exactly its own hours (checked on the AECI data). Before them, that held for
    `weatherIdx += (MAX_PREDICTION_WINDOW_HOURS-24)`, matching the first tier and test time.
 2. **`sort_index()` on the overlapping forecast file (fixed).** `modify_data_for_chunk` sorted the forecast DataFrame
    by timestamp and sliced it by row timestamp, so every 168 rows were no longer one issue's 7-day block.
-   `select_forecast_blocks` (`run_6month_forecasting.py:67`) now keeps whole blocks in file order. It keeps blocks
-   issued from the chunk's first day through its last day minus 6, which is one block per data day as
-   `splitWeatherDataset` and both rollouts assume. It raises an error if the file has a missing day or a broken block,
+   `select_forecast_blocks` in `run_6month_forecasting.py` now keeps whole blocks in file order. It keeps blocks
+   issued from the chunk's first day through its last day minus `BUFFER_HOURS // 24` days, which is one block per
+   data day as `splitWeatherDataset` and both rollouts assume. At the 168 h horizon that is 6 days. Both
+   `PREDICTION_WINDOW_HOURS` and `MAX_PREDICTION_WINDOW_HOURS` are read from the config. It raises an error if the file has a missing day or a broken block,
    for example after the weather aggregation drops a cycle.
 3. **Which day's weather is paired with which input (not a bug).** In both training and the rollout, block *b* is the
    forecast issued on data day *b*, and step *j* uses block rows `j*24 : j*24+24`. Those rows cover the *history*
@@ -162,7 +163,7 @@ it did for SARIMAX. It can also be less stable, since errors compound through th
 | `getScores`, `:788-826` | RMSE, MAPE, daily MAPE | add the 168 h-window c-index (lifelines and smooth) on test, and on val for carry-over, so the result matches SARIMAX's "forecast-week c-index". |
 | main loop, `:177-244` | one CSV per experiment | loop over variants (`baseline`, `eps_<e>`) and write one CI forecast file per variant. These files feed `CarbonCast-SARIMAX-mat`'s R concordance and scheduling figures. |
 | `secondTierConfig.json` | `SECOND_TIER_CNN_LSTM_MODEL_HYPERPARAMS` | add a `CONCORDANCE` block: `EPS`, `TAU`, `PRACTICE_ORIGIN_STRIDE_DAYS`, `PRACTICE_PERIOD` (train), solver settings and `SEEDS`. |
-| `run_6month_forecasting.py:26-60, 202` | per-chunk config and merge | pass the eps settings through, and merge per variant. |
+| `run_6month_forecasting.py`: `create_chunk_config`, `merge_forecast_results` | per-chunk config and merge | pass the eps settings through, and merge per variant. |
 
 ### 6.2 Solving the constrained problem
 SLSQP is not usable here. It builds a dense quasi-Newton matrix (17,340² ≈ 300M entries), and finite differences
