@@ -42,15 +42,16 @@ GRIB2_CMD = "wgrib2 -inv /dev/null"
 
 FILE_PREFIX = "gfs.0p25."
 # Where <REGION>/<var>/*.grib2 live. The default is the weather-data PVC, which
-# k8s/tar-job.yaml and k8s/debug-pod.yaml mount whole at /data; the download Job
-# instead mounts just the retraining_archive subPath at /app/retraining_archive.
+# the weather_download repo's k8s/tar-job.yaml and k8s/debug-pod.yaml mount
+# whole at /data; the download Job instead mounts just the retraining_archive
+# subPath at /app/retraining_archive.
 #
 # Overridable because reading the GRIB2 files straight off CephFS is ruinous:
 # each is only ~4.3 KB, every one is read exactly once so nothing caches, and
 # the measured cost was 1.58 s per file against 5.3 ms on local disk -- 300x,
-# and 206,590 files per region. scripts/aggregate_weather.sh therefore unpacks
-# the tars onto node-local scratch and points this at that instead, turning
-# 206,590 small CephFS reads into 32 large sequential ones.
+# and 206,590 files per region. weather_download's scripts/aggregate_weather.sh
+# therefore unpacks the tars onto node-local scratch and points this at that
+# instead, turning 206,590 small CephFS reads into 32 large sequential ones.
 ARCHIVE_ROOT = os.environ.get("WEATHER_ARCHIVE_ROOT", "/data/retraining_archive")
 UGRD_VGRD_SEPRATOR = {"CISO": 1886, "PJM": 2556, "SE": 2296, "DK-DK2": 221, 
                         "ERCO": 2116, "ISNE": 1056, "GB": 1978, "DE": 1254, 
@@ -118,7 +119,7 @@ def buildDateGroups(fileDir, fcstCol, yearList=YEARS):
     reuses the nearest earlier hour FROM THE SAME CYCLE, so a gap costs a few
     hours of staleness rather than a missing day.
 
-    Two things this does that getFileList() below does not.
+    Two things this does that getFileList() above does not.
 
     First, paths are built from fcstCol directly, so position i can only ever
     hold forecast hour fcstCol[i]. getFileList returns one flat list that the
@@ -195,7 +196,7 @@ def _gridOf(dataset):
     return lat, lon, cellArea, np.sum(cellArea)
 
 
-def getWeatherData(dateGroups, csvFields, outFileName, fcstCol, weatherVariable):
+def getWeatherData(dateGroups, csvFields, outFileName, weatherVariable):
     with open(outFileName, 'w') as csvfile:
         csvwriter = csv.writer(csvfile)
         csvwriter.writerow(csvFields)
@@ -252,7 +253,7 @@ def getWeatherData(dateGroups, csvFields, outFileName, fcstCol, weatherVariable)
     return
 
 
-def getWindData(dateGroups, csvFields, outFileName, fcstCol=FCST):
+def getWindData(dateGroups, csvFields, outFileName):
     with open(outFileName, 'w') as csvfile:
         csvwriter = csv.writer(csvfile)
         csvwriter.writerow(csvFields)
@@ -513,23 +514,23 @@ for ISO in ISO_LIST:
         if ("WIND" in OUT_FILE_NAME_LIST[xx]):
             print("WIND: ", OUT_FILE_NAME_LIST[xx])
             groups = buildDateGroups(FILE_DIR[xx], FCST)
-            getWindData(groups, CSV_FILE_FIELDS_FCST, OUT_FILE_NAME_LIST[xx], FCST)
+            getWindData(groups, CSV_FILE_FIELDS_FCST, OUT_FILE_NAME_LIST[xx])
         else:
             if ("TEMP" in OUT_FILE_NAME_LIST[xx]):
                 print("TEMP: ", OUT_FILE_NAME_LIST[xx])
                 groups = buildDateGroups(FILE_DIR[xx], FCST)
-                getWeatherData(groups, CSV_FILE_FIELDS_FCST, OUT_FILE_NAME_LIST[xx], FCST, "TEMP")
+                getWeatherData(groups, CSV_FILE_FIELDS_FCST, OUT_FILE_NAME_LIST[xx], "TEMP")
             elif ("DPT" in OUT_FILE_NAME_LIST[xx]):
                 print("DPT: ", OUT_FILE_NAME_LIST[xx])
                 groups = buildDateGroups(FILE_DIR[xx], FCST)
-                getWeatherData(groups, CSV_FILE_FIELDS_FCST, OUT_FILE_NAME_LIST[xx], FCST, "DPT")
+                getWeatherData(groups, CSV_FILE_FIELDS_FCST, OUT_FILE_NAME_LIST[xx], "DPT")
             elif ("DSWRF" in OUT_FILE_NAME_LIST[xx]):
                 print("DSWRF: ", OUT_FILE_NAME_LIST[xx])
                 groups = buildDateGroups(FILE_DIR[xx], FCST_AVG_ACC)
-                getWeatherData(groups, CSV_FILE_FIELDS_AVG, OUT_FILE_NAME_LIST[xx], FCST_AVG_ACC, "DSWRF")
+                getWeatherData(groups, CSV_FILE_FIELDS_AVG, OUT_FILE_NAME_LIST[xx], "DSWRF")
             elif ("PCP" in OUT_FILE_NAME_LIST[xx]):
                 print("PCP: ", OUT_FILE_NAME_LIST[xx])
                 groups = buildDateGroups(FILE_DIR[xx], FCST_AVG_ACC)
-                getWeatherData(groups, CSV_FILE_FIELDS_ACC, OUT_FILE_NAME_LIST[xx], FCST_AVG_ACC, "PCP")
+                getWeatherData(groups, CSV_FILE_FIELDS_ACC, OUT_FILE_NAME_LIST[xx], "PCP")
     print("*******************", ISO, " done *******************")
 
