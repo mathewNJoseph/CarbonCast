@@ -310,7 +310,7 @@ numbers, but only after the pick is fixed.
 | **Precondition (done):** `secondTierForecasts.py:502` and `select_forecast_blocks` in `run_6month_forecasting.py` | The weather stride and `sort_index` bugs are fixed (`CONCORDANCE_INTEGRATION.md` section 3). Without those fixes, X's weather (C_A) and the `wTrainData` blocks (C_B) would be misaligned. |
 | New module `src/concordance_tier2.py` | `build_windows`, `smooth_c`, `rollout_B`, `mse_train`, `solve_output_slsqp`, `switching_gradient`, `best_within` |
 | `trainingandValidationPhase`, after the `trainModel` call (`:868`) | Compute MSE_0, run the eps sweep and return `{"baseline": theta_0, "eps_<e>": theta_e, ...}`. Everything needed is already in scope. |
-| `trainModel`, `:524-584` | Unchanged. The existing `-s` flag loads the saved `<region>.h5` (`:535-538`), so the sweep can run on baselines you already have, with no retraining. |
+| `trainModel`, `:524-584` | Unchanged. The existing `-s` flag loads the saved `<region>.h5` (`:535-538`), so the sweep can run on baselines you already have, with no retraining. `run_6month_forecasting.py` keeps one model per chunk, in `saved_second_tier_models/<direct or lifecycle>/<H1 or H2>/<region>/`. |
 | Main loop in `runSecondTier`, `:177-190` | Loop over the variants. Call the **unchanged** `getDayAheadForecasts` on test for each one and write one CI forecast CSV per variant. |
 | `getScores`, `:788-826` | Add the 168 h-window c-index, both lifelines and smooth, so it matches SARIMAX's forecast-week c-index. |
 | `secondTierConfig.json` | Add a `CONCORDANCE` block: `OBJECTIVE` (`C24`, `A` or `B`), `EPS`, `TAU`, `SOLVERS` (any of `slsqp_output`, `switching_output`, `switching_all`), `SEEDS`. |
