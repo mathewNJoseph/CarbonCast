@@ -144,8 +144,9 @@ written in TensorFlow: batch all origins (174–177) and call `model(x, training
 `GradientTape`, concatenating the predicted CI into the next input. This is backpropagation through the 7-step
 recursion, the analogue of SARIMAX filtering through NaN endog. It is cheap: 7 forward passes on a batch of about 175.
 
-**Port `smooth_concordance` to TF.** Use `triu_indices` over 168 → 14,028 pairs per window, mask the ties in the
-actuals, and keep `std(f)` inside the graph so the optimizer cannot gain by stretching the forecast.
+**Port `smooth_concordance` to TF** (done: `smooth_c` in `src/concordance_tier2.py`). Use `triu_indices` over 168 →
+14,028 pairs per window, mask the ties in the actuals, and keep `std(f)` inside the graph so the optimizer cannot gain
+by stretching the forecast.
 
 **The rollout meets something new here.** SARIMAX's MLE already encodes multi-step dynamics. The CNN-LSTM was only
 ever fitted to 24 h, so the concordance term is the first multi-step training signal it gets. That can help more than
