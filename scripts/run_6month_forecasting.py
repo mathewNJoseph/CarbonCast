@@ -21,6 +21,7 @@ import pandas as pd
 import argparse
 from datetime import datetime
 import shutil
+import traceback
 
 # Add src directory to path to import secondTierForecasts
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
@@ -50,6 +51,15 @@ def create_chunk_config(base_config_path, chunk_type, output_config_path):
 
     # NUM_TEST_DAYS and NUM_VAL_DAYS depend on the chunk's dates and on how far
     # the region's data reaches, so update_config_for_chunk_data sets them.
+
+    # Each chunk trains its own model, so give each chunk its own model folder
+    # (for example saved_second_tier_models/direct/H1/AECI/). With one shared
+    # folder, H2 overwrites H1's model and scaling values, and -s loads the
+    # wrong chunk's model.
+    for key in ("DIRECT_SAVED_MODEL_LOCATION", "LIFECYCLE_SAVED_MODEL_LOCATION"):
+        config[key] = os.path.join(config[key], chunk_type, "")
+        for region in config["REGION_DIRECT"]:
+            os.makedirs(os.path.join(config[key], region), exist_ok=True)
 
     # Update output file naming based on chunk
     for region in config["REGION_DIRECT"]:
@@ -243,6 +253,7 @@ def run_chunk_forecast(config_path, cef_type, load_saved_model, chunk_type):
         print(f"\n✅ {chunk_type} forecasting completed successfully!")
         return True
     except Exception as e:
+        traceback.print_exc()
         print(f"\n❌ {chunk_type} forecasting failed: {str(e)}")
         return False
 
@@ -376,6 +387,7 @@ def main():
     print(f"Load saved model: {args.load_saved_model}")
     
     success_count = 0
+    merged = False  # the run succeeded only if both chunks ran and were merged
     
     try:
         # Run both chunks
@@ -407,6 +419,7 @@ def main():
             forecast_type = "direct" if args.cef_type == "-d" else "lifecycle"
             merged_file = merge_forecast_results(args.region, forecast_type, 0)
             if merged_file:
+                merged = True
                 print(f"\n🎉 6-Month Chunk Forecasting Completed Successfully!")
                 print(f"Final merged forecast: {merged_file}")
             else:
@@ -418,6 +431,7 @@ def main():
     except KeyboardInterrupt:
         print("\n\n⚠️  Process interrupted by user.")
     except Exception as e:
+        traceback.print_exc()
         print(f"\n❌ Unexpected error: {str(e)}")
     
     finally:
@@ -429,6 +443,8 @@ def main():
             print(f"\n📁 Temporary files preserved (--no-cleanup specified)")
     
     print(f"\n✅ Script completed.")
+    # Exit non-zero on failure, so a batch job that runs this script is marked failed.
+    sys.exit(0 if merged else 1)
 
 if __name__ == "__main__":
     main()
