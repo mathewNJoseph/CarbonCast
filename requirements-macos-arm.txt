@@ -14,5 +14,7 @@ statsmodels==0.13.2
 entsoe-py==0.5.10
 xarray==2023.7.0
 python-dotenv==1.0.1
+# For the tests in tests/ (python -m pytest tests)
+pytest==8.3.5
 # Compatibility pin for TF 2.9
 protobuf==3.20.*
