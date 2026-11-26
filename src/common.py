@@ -246,6 +246,32 @@ def splitWeatherDataset(dataset, testDataSize, valDataSize, predictionWindowHour
     print("No. of rows in test set:", len(testData))
     return trainData, valData, testData, fullTrainData
 
+def selectDailyBlocks(forecasts, firstDay, lastDay, blockHours):
+    """The rows of the forecast blocks issued on each day from firstDay through lastDay, in file order.
+
+    forecasts holds one blockHours-row block per issue time, indexed by row time; the blocks overlap.
+    splitWeatherDataset splits it by row count and pairs block b with day b of the dataset, so this
+    needs exactly one block per day: whole, in issue order, none missing. Sorting or slicing by row
+    timestamp breaks that. Raises ValueError, naming the missing days, if any day has no block.
+    """
+    numBlocks, leftover = divmod(len(forecasts), blockHours)
+    if leftover:
+        raise ValueError(f"Forecast file has {len(forecasts)} rows, not a multiple of {blockHours}")
+    rowTimes = forecasts.index.values.reshape(numBlocks, blockHours)
+    issueTimes = pd.DatetimeIndex(rowTimes[:, 0])
+    offsets = rowTimes - rowTimes[:, :1]
+    if not (offsets == pd.timedelta_range(0, periods=blockHours, freq="h").values).all():
+        raise ValueError(f"Forecast file blocks are not {blockHours} consecutive hours from their issue time")
+
+    first, last = pd.Timestamp(firstDay).normalize(), pd.Timestamp(lastDay).normalize()
+    keep = (issueTimes >= first) & (issueTimes <= last)
+    expected = pd.date_range(first, last, freq="D")
+    if not issueTimes[keep].equals(expected):
+        missing = expected.difference(issueTimes[keep])
+        raise ValueError(f"Forecast blocks for {first.date()}..{last.date()} are not one per day in order; "
+                         f"{len(missing)} missing, e.g. {list(missing[:5].date)}")
+    return forecasts.iloc[keep.repeat(blockHours)]
+
 def showModelSummary(history, model):
     print("Showing model summary...")
     model.summary()
