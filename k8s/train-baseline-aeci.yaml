@@ -1,0 +1,83 @@
+# Trains the AECI tier 2 baselines (direct and lifecycle, H1 and H2 chunks) on Nautilus.
+#
+#   kubectl apply -n cse239fall2025 -f k8s/train-baseline-aeci.yaml
+#   kubectl logs -n cse239fall2025 -f job/cc-baseline-aeci
+#   kubectl delete -n cse239fall2025 job/cc-baseline-aeci     # when done
+#
+# The pod clones the fork's CarbonCast-v3.2 branch, installs requirements.txt into the container (not onto
+# CephFS), runs scripts/run_6month_forecasting.py for each CEF type, and copies the models, CI forecasts and logs to
+#   spatial-rook:/carboncast/baselines/AECI/<UTC start time>/
+# with commit.txt recording the exact code that ran. The inputs are the AECI CSVs committed under data/AECI/.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cc-baseline-aeci
+spec:
+  backoffLimit: 0                  # a failed training run will fail the same way again
+  activeDeadlineSeconds: 21600     # guard against a hang; a run should take well under an hour
+  ttlSecondsAfterFinished: 86400   # the outputs and logs are on the PVC, so the finished Job can go after a day
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: train
+        image: python:3.10-bookworm   # TF 2.9 needs Python <= 3.10; the full image includes git
+        env:
+          - name: PYTHONUNBUFFERED
+            value: "1"
+          # Keep TF and BLAS to the one requested core, instead of one thread per core on the node.
+          - name: TF_NUM_INTRAOP_THREADS
+            value: "1"
+          - name: TF_NUM_INTEROP_THREADS
+            value: "1"
+          - name: OMP_NUM_THREADS
+            value: "1"
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -euo pipefail
+          OUT=/spatial-rook/carboncast/baselines/AECI/$(date -u +%Y%m%dT%H%M%SZ)
+          mkdir -p "$OUT"
+          echo "Writing to $OUT"
+
+          git clone --depth 1 --branch CarbonCast-v3.2 https://github.com/mathewNJoseph/CarbonCast.git /tmp/cc
+          cd /tmp/cc
+          git rev-parse HEAD > "$OUT/commit.txt"
+          pip install --no-cache-dir -q -r requirements.txt
+
+          status=0
+          for cef in direct lifecycle; do
+            python scripts/run_6month_forecasting.py src/secondTierConfig.json --$cef --region AECI 2>&1 \
+              | tee "$OUT/$cef.log" || status=1
+          done
+
+          # Copy whatever was produced, even if a run failed, so it can be inspected.
+          for cef in direct lifecycle; do
+            for chunk in H1 H2; do
+              src=saved_second_tier_models/$cef/$chunk
+              if [ -d "$src" ]; then
+                mkdir -p "$OUT/$src" && cp -r "$src/." "$OUT/$src/"
+              fi
+            done
+          done
+          mkdir -p "$OUT/CI_forecast_data" && cp CI_forecast_data/AECI/AECI_*_168hr_CI_forecasts_*.csv "$OUT/CI_forecast_data/"
+          echo "Finished with status $status; outputs in $OUT"
+          exit $status
+        # Measured locally: peak memory 0.66 GB and under one core. 1 CPU / 2 GiB is also the size NRP exempts from
+        # its usage-ratio checks. Limits equal requests.
+        resources:
+          requests:
+            cpu: "1"
+            memory: 2Gi
+            ephemeral-storage: 8Gi   # the clone (~1 GB) and the installed packages (~2 GB)
+          limits:
+            cpu: "1"
+            memory: 2Gi
+            ephemeral-storage: 8Gi
+        volumeMounts:
+        - mountPath: /spatial-rook
+          name: spatial-rook
+      volumes:
+      - name: spatial-rook
+        persistentVolumeClaim:
+          claimName: spatial-rook
