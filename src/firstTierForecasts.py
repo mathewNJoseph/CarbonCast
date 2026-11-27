@@ -89,6 +89,7 @@ def runFirstTier(configFileName):
                 periodIdx = 0
                 for period in trainTestPeriodConfig:
                     print(trainTestPeriodConfig[period])
+                    datasetStart = trainTestPeriodConfig[period]["DATASET_START"]
                     datasetLimiter = trainTestPeriodConfig[period]["DATASET_LIMITER"]
                     numTestDays = trainTestPeriodConfig[period]["NUM_TEST_DAYS"]
                     numValDays = firstTierConfig["NUM_VAL_DAYS"]
@@ -96,7 +97,7 @@ def runFirstTier(configFileName):
 
                     print("Initializing...")
                     dataset, dateTime, bufferPeriod, bufferDates, weatherDataset = initialize(
-                                inFileName, weatherForecastInFileName, sourceCol, datasetLimiter)
+                                inFileName, weatherForecastInFileName, sourceCol, datasetStart, datasetLimiter)
                     # bufferPeriod is for the last test date, if prediction period is beyond 24 hours
                     if (isRenewableSource):
                         # splitWeatherDataset pairs weather block b with day b of the dataset, so keep
@@ -451,7 +452,7 @@ def aggregateDataAndGenerateForecastIssuanceFile(firstTierConfig, sourceList, we
     issuanceDF.to_csv(aggregatedForecastIssuanceFileName)
     return
 
-def initialize(inFileName, weatherForecastInFileName, startCol, datasetLimiter):
+def initialize(inFileName, weatherForecastInFileName, startCol, datasetStart, datasetLimiter):
 
     global BUFFER_HOURS
     # load the new file
@@ -474,9 +475,9 @@ def initialize(inFileName, weatherForecastInFileName, startCol, datasetLimiter):
     print("Features related to date & time added")
 
     bufferPeriod = dataset[datasetLimiter:datasetLimiter+BUFFER_HOURS]
-    dataset = dataset[:datasetLimiter]
+    dataset = dataset[datasetStart:datasetLimiter]
     bufferDates = dateTime[datasetLimiter:datasetLimiter+BUFFER_HOURS]
-    dateTime = dateTime[:datasetLimiter]
+    dateTime = dateTime[datasetStart:datasetLimiter]
     
     for i in range(startCol, len(dataset.columns.values)):
         col = dataset.columns.values[i]

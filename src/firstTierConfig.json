@@ -36,13 +36,15 @@
 
     "TRAIN_TEST_PERIOD": {
         "PERIOD_0": {
-            // Train on 2019-2021, Test on 2022
+            // Train on 2019-2021, Test on 2022. Rows [DATASET_START, DATASET_LIMITER) of the hourly data.
+            "DATASET_START": 0,
             "DATASET_LIMITER": 35064,
             "OUT_FILE_SUFFIX": "2022",
             "NUM_TEST_DAYS": 365
         },
         "PERIOD_1": {
-            // Train on 2019-2022, Test on 2023
+            // Train on 2020-2022, Test on 2023: three training years, as in PERIOD_0
+            "DATASET_START": 8760,
             "DATASET_LIMITER": 43824,
             "OUT_FILE_SUFFIX": "2023",
             "NUM_TEST_DAYS": 365
