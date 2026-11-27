@@ -8,8 +8,7 @@
 #
 # Pod i runs REGIONS[i]. Its inputs are data/<R>/ in the repo if they are committed there (AECI), otherwise
 # spatial-rook:/carboncast/inputs/<R>/ (put there with k8s/upload-concordance-inputs.yaml):
-#   <R>_168hr_forecasts_DA.csv, <R>_direct_emissions.csv and, optionally, <R>_lifecycle_emissions.csv.
-# Each CEF type with an emissions file is run. Outputs (models, CI forecasts, concordance summaries, logs) go to
+#   <R>_168hr_forecasts_DA.csv and <R>_direct_emissions.csv. Only direct emissions are run. Outputs (models, CI forecasts, concordance summaries, logs) go to
 #   spatial-rook:/carboncast/concordance/<Job uid>/<R>/
 # with commit.txt recording the code that ran.
 #
@@ -71,12 +70,8 @@ spec:
           python scripts/make_region_config.py src/secondTierConfig.json "$R" "src/secondTierConfig_$R.json"
 
           status=0
-          for cef in direct lifecycle; do
-            if [ -f "data/$R/${R}_${cef}_emissions.csv" ]; then
-              python scripts/run_6month_forecasting.py "src/secondTierConfig_$R.json" --$cef --region "$R" 2>&1 \
-                | tee "$OUT/$cef.log" || status=1
-            fi
-          done
+          python scripts/run_6month_forecasting.py "src/secondTierConfig_$R.json" --direct --region "$R" 2>&1 \
+            | tee "$OUT/direct.log" || status=1
 
           # Copy whatever was produced, even if a run failed, so it can be inspected.
           for d in saved_second_tier_models/*/H?/"$R"; do
