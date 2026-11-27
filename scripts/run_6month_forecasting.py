@@ -25,6 +25,7 @@ import traceback
 
 # Add src directory to path to import secondTierForecasts
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
+import common
 import secondTierForecasts
 
 # Calendar dates of each chunk. test_start..test_end are the days the test
@@ -99,25 +100,9 @@ def select_forecast_blocks(forecasts_df, start_date, end_date, block_hours, pred
     if block_hours % 24 or prediction_hours % 24 or not 24 <= prediction_hours <= block_hours:
         raise ValueError(f"PREDICTION_WINDOW_HOURS ({prediction_hours}) and MAX_PREDICTION_WINDOW_HOURS "
                          f"({block_hours}) must be multiples of 24 with 24 <= prediction <= max")
-    num_blocks, leftover = divmod(len(forecasts_df), block_hours)
-    if leftover:
-        raise ValueError(f"Forecast file has {len(forecasts_df)} rows, not a multiple of {block_hours}")
-    row_times = forecasts_df.index.values.reshape(num_blocks, block_hours)
-    issue_dates = pd.DatetimeIndex(row_times[:, 0])
-    offsets = row_times - row_times[:, :1]
-    if not (offsets == pd.timedelta_range(0, periods=block_hours, freq="h").values).all():
-        raise ValueError(f"Forecast file blocks are not {block_hours} consecutive hours from their issue time")
-
     buffer_days = (prediction_hours - 24) // 24   # BUFFER_HOURS // 24 in secondTierForecasts
-    first = pd.Timestamp(start_date)
     last = pd.Timestamp(end_date).normalize() - pd.Timedelta(days=buffer_days)
-    keep = (issue_dates >= first) & (issue_dates <= last)
-    expected = pd.date_range(first, last, freq="D")
-    if not issue_dates[keep].equals(expected):
-        missing = expected.difference(issue_dates[keep])
-        raise ValueError(f"Forecast blocks for {first.date()}..{last.date()} are not one per day "
-                         f"in order; {len(missing)} missing, e.g. {list(missing[:5].date)}")
-    return forecasts_df.iloc[keep.repeat(block_hours)]
+    return common.selectDailyBlocks(forecasts_df, start_date, last, block_hours)
 
 def last_full_day(df):
     """The last day whose 23:00 hour is present in an hourly, sorted DataFrame."""

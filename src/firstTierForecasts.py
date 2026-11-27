@@ -32,7 +32,6 @@ TRAINING_WINDOW_HOURS = None
 PREDICTION_WINDOW_HOURS = None
 MODEL_SLIDING_WINDOW_LEN = None
 BUFFER_HOURS = None
-WEATHER_STRIDE_HOURS = None  # configurable cadence between successive weather forecast issuance blocks
 
 ############################# MACRO END #########################################
 
@@ -41,7 +40,6 @@ def runFirstTier(configFileName):
     global PREDICTION_WINDOW_HOURS
     global MODEL_SLIDING_WINDOW_LEN
     global BUFFER_HOURS
-    global WEATHER_STRIDE_HOURS
 
     firstTierConfig = {}
 
@@ -54,9 +52,6 @@ def runFirstTier(configFileName):
     PREDICTION_WINDOW_HOURS = firstTierConfig["PREDICTION_WINDOW_HOURS"]
     MODEL_SLIDING_WINDOW_LEN = firstTierConfig["MODEL_SLIDING_WINDOW_LEN"]
     BUFFER_HOURS = PREDICTION_WINDOW_HOURS - 24
-    # Optional stride parameter (default: horizon -> legacy behavior). When set < horizon (e.g. 24),
-    # weather forecast blocks are assumed to be issued every WEATHER_STRIDE_HOURS with length PREDICTION_WINDOW_HOURS.
-    WEATHER_STRIDE_HOURS = firstTierConfig.get("WEATHER_STRIDE_HOURS", PREDICTION_WINDOW_HOURS)
 
     regionList = firstTierConfig["REGION"]
     for region in regionList:
@@ -97,23 +92,22 @@ def runFirstTier(configFileName):
                     datasetLimiter = trainTestPeriodConfig[period]["DATASET_LIMITER"]
                     numTestDays = trainTestPeriodConfig[period]["NUM_TEST_DAYS"]
                     numValDays = firstTierConfig["NUM_VAL_DAYS"]
-                    # Dynamically compute number of weather rows required.
-                    # If stride == horizon (legacy), this collapses to num_days * horizon.
-                    # General formula for flattened concatenated forecast blocks with overlap:
-                    #   total_rows = horizon + (num_blocks-1)*stride, where num_blocks ≈ num_days (one issuance per day)
-                    num_days = datasetLimiter // 24
-                    num_blocks = num_days  # one issuance per day assumption consistent with previous logic
-                    weatherDatasetLimiter = 0
-                    if num_blocks > 0:
-                        weatherDatasetLimiter = PREDICTION_WINDOW_HOURS + (num_blocks - 1) * WEATHER_STRIDE_HOURS
-                    # Cap to available length implicitly when slicing later
                     print(numTestDays)
 
                     print("Initializing...")
                     dataset, dateTime, bufferPeriod, bufferDates, weatherDataset = initialize(
-                                inFileName, weatherForecastInFileName, sourceCol,
-                                datasetLimiter, weatherDatasetLimiter)
+                                inFileName, weatherForecastInFileName, sourceCol, datasetLimiter)
                     # bufferPeriod is for the last test date, if prediction period is beyond 24 hours
+                    if (isRenewableSource):
+                        # splitWeatherDataset pairs weather block b with day b of the dataset, so keep
+                        # exactly the blocks issued on the dataset's own days. The weather file can
+                        # start or end on other dates than the electricity data.
+                        try:
+                            weatherDataset = common.selectDailyBlocks(weatherDataset, dateTime[0], dateTime[-1],
+                                                                      PREDICTION_WINDOW_HOURS)
+                        except ValueError as e:
+                            raise ValueError(f"{weatherForecastInFileName} cannot be paired with {source} "
+                                             f"for {period}: {e}") from e
                     print("***** Initialization done *****")
 
                     # split into train and test
@@ -369,18 +363,11 @@ def runFirstTierInRealTime(configFileName, regionList, startDate, electricityDat
 def aggregateDataAndGenerateForecastFile(firstTierConfig, sourceList, weatherForecastFile,
                                          sourceForecastFileNamePrefix, aggregatedForecastFileName,
                                          isRealTime = False, startDate=None):
-    # Offline (training/evaluation) case: retain overlapping forecast rows (original 96hr-style behavior).
-    weatherDatasetStartRow = firstTierConfig["ROW_START_FOR_2020"]
-    weatherDatasetEndRow = firstTierConfig["ROW_END_FOR_2022"]
-    sourceForecastDatasetEndRow = firstTierConfig["SOURCE_FORECAST_ROW_END_FOR_2022"]
     horizon = firstTierConfig["PREDICTION_WINDOW_HOURS"]
 
-    # Read weather
-    weatherDataset = pd.read_csv(weatherForecastFile, header=0, parse_dates=["datetime"], index_col=["datetime"])    
+    # Read weather. Preserve the file order (do not sort): it is one block per issue time.
+    weatherDataset = pd.read_csv(weatherForecastFile, header=0, parse_dates=["datetime"], index_col=["datetime"])
     weatherDataset.index = pd.to_datetime(weatherDataset.index).tz_localize(None)
-    # Preserve original order (do not sort) to keep issuance sequence intact.
-    if (isRealTime is False):
-        weatherDataset = weatherDataset[weatherDatasetStartRow:weatherDatasetEndRow]
 
     if isRealTime:
         # Preserve legacy real-time aggregation (unique hourly timeline)
@@ -397,74 +384,42 @@ def aggregateDataAndGenerateForecastFile(firstTierConfig, sourceList, weatherFor
         modifiedDataset.to_csv(aggregatedForecastFileName)
         return
 
-    # Overlapping stacked output path (always used offline)
-    print("Producing overlapping stacked DA output (horizon=", horizon, ") ...")
-    # Build a master timeline from the first source forecast file preserving its row order (with duplicates)
-    master_timeline = None
-    source_data = {}
-    for idx, source in enumerate(sourceList):
+    # Offline: keep the overlapping blocks. The source forecast files hold one horizon-row block per test
+    # origin, in the same order for every source. Each block gets the weather block issued at the same
+    # time, so every row carries the forecast its own block was made with.
+    forecasts = None
+    for source in sourceList:
         sourceForecastFileName = sourceForecastFileNamePrefix + "_" + source.lower() + "_iter0.csv"
-        srcDF = pd.read_csv(sourceForecastFileName, header=0, parse_dates=["datetime"], dtype={})
-        if sourceForecastDatasetEndRow is not None:
-            srcDF = srcDF[:sourceForecastDatasetEndRow]
-        if master_timeline is None:
-            master_timeline = srcDF['datetime'].tolist()
-        else:
-            # Basic validation: length & per-row datetime equality (best effort)
-            if len(srcDF['datetime']) != len(master_timeline):
-                print(f"[WARN] Source {source} forecast length {len(srcDF)} doesn't match master timeline {len(master_timeline)}; will align by position up to min length.")
-            # Could add deeper validation if needed.
+        srcDF = pd.read_csv(sourceForecastFileName, header=0, parse_dates=["datetime"])
         fc_col = "avg_" + source.lower() + "_production_forecast"
-        if fc_col not in srcDF.columns:
-            print(f"[WARN] Missing forecast column {fc_col} in {sourceForecastFileName}; filling NaNs")
-            source_data[fc_col] = pd.Series([np.nan]*len(srcDF))
-        else:
-            source_data[fc_col] = srcDF[fc_col].reset_index(drop=True)
-    if master_timeline is None:
-        print("[ERROR] No source forecast files found; abort overlapping aggregation.")
-        return
-    master_len = min(len(v) for v in source_data.values()) if source_data else 0
-    master_timeline = master_timeline[:master_len]
-    # Prepare weather lookup (first occurrence per timestamp)
-    weatherCols = [c for c in weatherDataset.columns if c.startswith('forecast_avg_')]
-    if not weatherCols:
-        weatherCols = list(weatherDataset.columns)
-    weather_unique = weatherDataset[weatherCols].copy()
-    if weather_unique.index.has_duplicates:
-        weather_unique = weather_unique.groupby(level=0).first()
-    # Map weather for each timeline datetime
-    weather_rows = []
-    missing_weather = 0
-    for ts in master_timeline:
-        row = weather_unique.loc[ts] if ts in weather_unique.index else None
-        if row is None or (isinstance(row, pd.Series) and row.isna().all()):
-            missing_weather += 1
-            weather_rows.append([np.nan]*len(weatherCols))
-        else:
-            if isinstance(row, pd.DataFrame):  # unlikely after groupby.first
-                row = row.iloc[0]
-            weather_rows.append(row.values.tolist())
-    if missing_weather:
-        print(f"[WARN] {missing_weather} timestamps missing weather; filled NaNs")
-    import pandas as _pd
-    assembled = _pd.DataFrame(weather_rows, columns=weatherCols)
-    # Attach forecast columns
-    for col, series in source_data.items():
-        if len(series) > master_len:
-            series = series.iloc[:master_len]
-        assembled[col] = series.values
-    assembled.insert(0, 'datetime', master_timeline)
-    # Forward-fill any remaining weather NaNs to mimic original behavior of having filled values
-    weather_only_cols = [c for c in assembled.columns if c.startswith('forecast_avg_')]
-    if weather_only_cols:
-        before_na = assembled[weather_only_cols].isna().sum().sum()
-        if before_na:
-            assembled[weather_only_cols] = assembled[weather_only_cols].fillna(method='ffill').fillna(method='bfill')
-            after_na = assembled[weather_only_cols].isna().sum().sum()
-            if after_na == 0:
-                print(f"[INFO] Filled {before_na} weather NaN cells via ffill/bfill")
-            else:
-                print(f"[WARN] {after_na} weather NaN cells remain after fill attempts")
+        if forecasts is None:
+            forecasts = srcDF[["datetime"]].copy()
+        elif not srcDF["datetime"].equals(forecasts["datetime"]):
+            raise ValueError(f"{sourceForecastFileName} has different rows from {sourceList[0]}'s forecast file")
+        forecasts[fc_col] = srcDF[fc_col].values
+
+    numBlocks, leftover = divmod(len(forecasts), horizon)
+    if leftover:
+        raise ValueError(f"Source forecast files have {len(forecasts)} rows, not a multiple of {horizon}")
+    forecastIssue = pd.DatetimeIndex(forecasts["datetime"].values[::horizon])
+    weatherCols = [c for c in weatherDataset.columns if c.startswith('forecast_avg_')] or list(weatherDataset.columns)
+    weatherIssue = pd.DatetimeIndex(weatherDataset.index.values[::horizon])
+    weatherBlock = weatherIssue.get_indexer(forecastIssue)  # -1 where no weather block was issued then
+
+    if (weatherBlock < 0).any():
+        missing = forecastIssue[weatherBlock < 0]
+        print(f"[WARN] No weather forecast issued at {len(missing)} forecast issue times "
+              f"({missing[0]}..{missing[-1]}); dropping those forecast blocks.")
+    hours = np.arange(horizon)
+    keptBlocks = np.flatnonzero(weatherBlock >= 0)
+    forecastRows = (keptBlocks[:, None] * horizon + hours).ravel()
+    weatherRows = (weatherBlock[keptBlocks][:, None] * horizon + hours).ravel()
+    assembled = forecasts.iloc[forecastRows].reset_index(drop=True)
+    weather = weatherDataset[weatherCols].iloc[weatherRows]
+    if not (weather.index.values == assembled["datetime"].values).all():
+        raise ValueError("Weather blocks do not cover the same hours as the forecast blocks they were paired with")
+    for col in reversed(weatherCols):
+        assembled.insert(1, col, weather[col].values)
     print("Aggregated (overlapping) rows, cols:", assembled.shape)
     assembled.to_csv(aggregatedForecastFileName, index=False)
     return
@@ -496,8 +451,7 @@ def aggregateDataAndGenerateForecastIssuanceFile(firstTierConfig, sourceList, we
     issuanceDF.to_csv(aggregatedForecastIssuanceFileName)
     return
 
-def initialize(inFileName, weatherForecastInFileName, startCol, datasetLimiter,
-                weatherDatasetLimiter):
+def initialize(inFileName, weatherForecastInFileName, startCol, datasetLimiter):
 
     global BUFFER_HOURS
     # load the new file
@@ -523,8 +477,6 @@ def initialize(inFileName, weatherForecastInFileName, startCol, datasetLimiter,
     dataset = dataset[:datasetLimiter]
     bufferDates = dateTime[datasetLimiter:datasetLimiter+BUFFER_HOURS]
     dateTime = dateTime[:datasetLimiter]
-
-    weatherDataset = weatherDataset[:weatherDatasetLimiter]
     
     for i in range(startCol, len(dataset.columns.values)):
         col = dataset.columns.values[i]
