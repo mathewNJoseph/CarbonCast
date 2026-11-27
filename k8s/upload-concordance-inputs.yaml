@@ -1,0 +1,30 @@
+# A short-lived pod for copying the tier 2 inputs of the concordance run onto spatial-rook. It only sleeps, so it is
+# a bare pod (interactive use, deleted by NRP after 6 hours), not a Job. Delete it as soon as the copy is done.
+#
+#   kubectl apply -n cse239fall2025 -f k8s/upload-concordance-inputs.yaml
+#   kubectl wait -n cse239fall2025 --for=condition=Ready pod/cc-upload
+#   sh k8s/upload_concordance_inputs.sh ../CarbonCast-SARIMAX-mat AZPS BPAT CISO DUK EPE ERCO IPCO ISNE MISO NEVP \
+#      NWMT PACE SCEG SRP SWPP TIDC TVA
+#   kubectl delete -n cse239fall2025 pod/cc-upload
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cc-upload
+spec:
+  restartPolicy: Never
+  activeDeadlineSeconds: 7200     # gone after 2 hours even if the delete is forgotten
+  containers:
+  - name: upload
+    image: busybox:1.36           # has tar, which kubectl cp needs
+    command: ["sleep", "7200"]
+    # 1 CPU / 2 GiB is the size NRP exempts from its usage-ratio checks; the pod idles apart from the copy.
+    resources:
+      requests: {cpu: "1", memory: 2Gi, ephemeral-storage: 1Gi}
+      limits: {cpu: "1", memory: 2Gi, ephemeral-storage: 1Gi}
+    volumeMounts:
+    - mountPath: /spatial-rook
+      name: spatial-rook
+  volumes:
+  - name: spatial-rook
+    persistentVolumeClaim:
+      claimName: spatial-rook

@@ -1,0 +1,105 @@
+# Tier 2 baselines plus the constrained concordance sweep (src/concordance_tier2.py) for several regions, one
+# region per pod.
+#
+#   kubectl apply -n cse239fall2025 -f k8s/concordance-regions.yaml
+#   kubectl get pods -n cse239fall2025 -l job-name=cc-concordance-regions
+#   kubectl logs -n cse239fall2025 cc-concordance-regions-<index>-<suffix>
+#   kubectl delete -n cse239fall2025 job/cc-concordance-regions     # when done
+#
+# Pod i runs REGIONS[i]. Its inputs are data/<R>/ in the repo if they are committed there (AECI), otherwise
+# spatial-rook:/carboncast/inputs/<R>/ (put there with k8s/upload-concordance-inputs.yaml):
+#   <R>_168hr_forecasts_DA.csv, <R>_direct_emissions.csv and, optionally, <R>_lifecycle_emissions.csv.
+# Each CEF type with an emissions file is run. Outputs (models, CI forecasts, concordance summaries, logs) go to
+#   spatial-rook:/carboncast/concordance/<Job uid>/<R>/
+# with commit.txt recording the code that ran.
+#
+# completions and parallelism must equal the number of REGIONS.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cc-concordance-regions
+spec:
+  completionMode: Indexed
+  completions: 18
+  parallelism: 18
+  backoffLimitPerIndex: 0          # a failed region fails the same way again, and does not stop the others
+  maxFailedIndexes: 18
+  activeDeadlineSeconds: 86400     # guard against a hang; a region should take well under a day on 1 CPU
+  ttlSecondsAfterFinished: 86400   # outputs and logs are on the PVC
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: run
+        image: python:3.10-bookworm   # TF 2.9 needs Python <= 3.10; the full image includes git
+        env:
+          - name: REGIONS
+            value: "AECI AZPS BPAT CISO DUK EPE ERCO IPCO ISNE MISO NEVP NWMT PACE SCEG SRP SWPP TIDC TVA"
+          - name: BRANCH
+            value: CarbonCast-v3.2
+          - name: JOB_UID
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.labels['batch.kubernetes.io/controller-uid']
+          - name: PYTHONUNBUFFERED
+            value: "1"
+          # Keep TF and BLAS to the one requested core, instead of one thread per core on the node.
+          - name: TF_NUM_INTRAOP_THREADS
+            value: "1"
+          - name: TF_NUM_INTEROP_THREADS
+            value: "1"
+          - name: OMP_NUM_THREADS
+            value: "1"
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -euo pipefail
+          read -ra regions <<< "$REGIONS"
+          R=${regions[$JOB_COMPLETION_INDEX]}
+          OUT=/spatial-rook/carboncast/concordance/$JOB_UID/$R
+          mkdir -p "$OUT"
+          echo "Region $R; writing to $OUT"
+
+          git clone --depth 1 --branch "$BRANCH" https://github.com/mathewNJoseph/CarbonCast.git /tmp/cc
+          cd /tmp/cc
+          git rev-parse HEAD > "$OUT/commit.txt"
+          pip install --no-cache-dir -q -r requirements.txt
+
+          if [ ! -f "data/$R/${R}_168hr_forecasts_DA.csv" ]; then
+            mkdir -p "data/$R" && cp /spatial-rook/carboncast/inputs/$R/*.csv "data/$R/"
+          fi
+          python scripts/make_region_config.py src/secondTierConfig.json "$R" "src/secondTierConfig_$R.json"
+
+          status=0
+          for cef in direct lifecycle; do
+            if [ -f "data/$R/${R}_${cef}_emissions.csv" ]; then
+              python scripts/run_6month_forecasting.py "src/secondTierConfig_$R.json" --$cef --region "$R" 2>&1 \
+                | tee "$OUT/$cef.log" || status=1
+            fi
+          done
+
+          # Copy whatever was produced, even if a run failed, so it can be inspected.
+          for d in saved_second_tier_models/*/H?/"$R"; do
+            [ -d "$d" ] && mkdir -p "$OUT/$d" && cp -r "$d/." "$OUT/$d/"
+          done
+          [ -d "CI_forecast_data/$R" ] && cp -r "CI_forecast_data/$R" "$OUT/CI_forecast_data"
+          echo "Finished $R with status $status; outputs in $OUT"
+          exit $status
+        # Measured locally on AECI: peak memory 0.25 GB. 1 CPU / 2 GiB is also the size NRP exempts from its
+        # usage-ratio checks. Limits equal requests.
+        resources:
+          requests:
+            cpu: "1"
+            memory: 2Gi
+            ephemeral-storage: 8Gi   # the clone (~1 GB) and the installed packages (~2 GB)
+          limits:
+            cpu: "1"
+            memory: 2Gi
+            ephemeral-storage: 8Gi
+        volumeMounts:
+        - mountPath: /spatial-rook
+          name: spatial-rook
+      volumes:
+      - name: spatial-rook
+        persistentVolumeClaim:
+          claimName: spatial-rook
