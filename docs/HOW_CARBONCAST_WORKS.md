@@ -34,8 +34,8 @@ second tier then *learns* to predict CI, with the source forecasts as input feat
 - **Output:** the next 24 h of that source.
 - **Training:** windows sliding by 1 hour, always with real history as input. A `ModelCheckpoint` on the last 30 days'
   validation loss picks the model (`NUM_VAL_DAYS: 30`).
-- **Periods** (`TRAIN_TEST_PERIOD`): `PERIOD_0` trains on 2019–2021 and forecasts 2022; `PERIOD_1` trains on 2019–2022
-  and forecasts 2023. Both sets of forecasts are out of sample.
+- **Periods** (`TRAIN_TEST_PERIOD`): `PERIOD_0` trains on 2019–2021 and forecasts 2022; `PERIOD_1` trains on 2020–2022
+  and forecasts 2023 (three training years each, rows `[DATASET_START, DATASET_LIMITER)`). Both sets of forecasts are out of sample.
 - **168 h forecast:** each day, the 24 h model is chained 7 times with its own predictions fed back in
   (`getDayAheadForecasts`, `:668-712`), then the next day restarts from actual data (section 4). For CISO, the
   published day-ahead solar/wind forecasts replace day 1 when available (`PARTIAL_FORECAST_AVAILABILITY_LIST`).
