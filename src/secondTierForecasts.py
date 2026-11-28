@@ -27,6 +27,7 @@ from keras.layers import RepeatVector
 import json5 as json
 
 import common
+import concordance_tier2
 import utility
 
 
@@ -243,6 +244,13 @@ def runSecondTier(configFileName, cefType, loadFromSavedModel):
             if (writeCIForecastsToFile == "True"):
                 common.writeOutFile(outFileNamePrefix+"_"+str(exptNum)+".csv", data, "carbon_intensity", "w")
 
+            if (secondTierConfig.get("CONCORDANCE", {}).get("SOLVERS")):
+                runConcordanceSweep(bestModel, region, secondTierConfig["CONCORDANCE"], exptNum,
+                                    trainData, wTrainData, valData, wValData, testData, wTestData,
+                                    validationDates, testDates, ftMin, ftMax, wFtMin, wFtMax,
+                                    numFeaturesInTraining, forecastDataset.columns.values[:numForecastFeatures],
+                                    outFileNamePrefix)
+
         print("[BEST] Average RMSE after ", NUMBER_OF_EXPERIMENTS, " expts: ", np.mean(bestRMSE))
         print("[BEST] Average MAPE after ", NUMBER_OF_EXPERIMENTS, " expts: ", np.mean(bestMAPE))
         print(bestRMSE)
@@ -254,6 +262,128 @@ def runSecondTier(configFileName, cefType, loadFromSavedModel):
 
         
     return
+
+def rolloutAndScore(model, priorData, priorWeather, data, wData, dates, ftMin, ftMax, wFtMin, wFtMax,
+                    numFeatures, forecastColumns):
+    """Day-ahead rollouts over data, exactly as at test, and their scores.
+
+    priorData and priorWeather are the split before data (train before val, val before test): the first
+    origin's history and weather block come from their last day, as runSecondTier does for test.
+    Returns the rollouts (origins x PREDICTION_WINDOW_HOURS, scaled), the c-index, MAPE and MAE.
+    """
+    history = priorData[-TRAINING_WINDOW_HOURS:, :].tolist()
+    weatherData = priorWeather[-MAX_PREDICTION_WINDOW_HOURS:, :]
+    predicted = getDayAheadForecasts(model, history, data, TRAINING_WINDOW_HOURS, numFeatures,
+                                     DEPENDENT_VARIABLE_COL, wFtMin[5:], wFtMax[5:],
+                                     ftMin[DEPENDENT_VARIABLE_COL], ftMax[DEPENDENT_VARIABLE_COL],
+                                     wData, weatherData, forecastColumns)
+    actual = manipulateTestDataShape(data[:, DEPENDENT_VARIABLE_COL], MODEL_SLIDING_WINDOW_LEN,
+                                     PREDICTION_WINDOW_HOURS, False)
+    unscaledActual, unscaledPredicted, formattedDates, _, mapeScore, _ = getUnscaledForecastsAndForecastAccuracy(
+        data, dates, predicted, ftMin, ftMax)
+    scores = {"c": concordance_tier2.hard_c(predicted, actual), "mape": float(mapeScore),
+              "mae": float(np.mean(np.abs(unscaledActual - unscaledPredicted)))}
+    return (unscaledActual, unscaledPredicted, formattedDates), scores
+
+def runConcordanceSweep(baseline, region, concordanceConfig, exptNum, trainData, wTrainData, valData, wValData,
+                        testData, wTestData, validationDates, testDates, ftMin, ftMax, wFtMin, wFtMax,
+                        numFeatures, forecastColumns, outFileNamePrefix):
+    """Constrained concordance fine-tune of the baseline (docs/TIER2_CONCORDANCE_DESIGN.md, section 5).
+
+    For each eps and each solver in SOLVERS, the model is moved to maximise the smooth c-index over the
+    training practice windows (C_A) while the training MSE stays within (1+eps) of the baseline's:
+      slsqp_output      SLSQP on the final Dense layer (variant A)
+      switching_output  switching gradient on the final Dense layer (variant B)
+      switching_all     switching gradient on every weight (variant C)
+    Every variant, the baseline included, is then rolled out on validation and test exactly as at test time.
+    The variant and eps are chosen on the validation rollouts' c-index; test is reported for every variant.
+    Writes one CI forecast CSV per variant and <prefix>_concordance_summary_<exptNum>.csv.
+    """
+    solvers = concordanceConfig["SOLVERS"]
+    unknown = set(solvers) - {"slsqp_output", "switching_output", "switching_all"}
+    if concordanceConfig.get("OBJECTIVE", "A") != "A" or unknown:
+        raise ValueError(f"Only OBJECTIVE 'A' is implemented, with SOLVERS from slsqp_output, switching_output "
+                         f"and switching_all (unknown: {sorted(unknown)})")
+    tau = concordanceConfig.get("TAU", concordance_tier2.DEFAULT_TAU)
+    epsGrid = concordanceConfig["EPS"]
+
+    print("\n[CONCORDANCE] Building practice windows...")
+    X, y = manipulateTrainingDataShape(trainData, TRAINING_WINDOW_HOURS, TRAINING_WINDOW_HOURS, wTrainData)
+    valX, valY = manipulateTrainingDataShape(valData, TRAINING_WINDOW_HOURS, TRAINING_WINDOW_HOURS, wValData)
+    # Training ends where validation starts, so whole training days and validation starting at 00:00 mean
+    # training starts at 00:00 too, and sample 24*d is a day boundary.
+    if len(trainData) % 24 or pd.Timestamp(validationDates[0]).hour != 0:
+        raise ValueError("Training data is not whole days from 00:00, so sample 24*d is not a day boundary")
+    windows, valWindows = concordance_tier2.practice_windows(len(X)), concordance_tier2.practice_windows(len(valX))
+    trainProblem = concordance_tier2.ModelProblem(X, y, windows, tau)
+    valProblem = concordance_tier2.ModelProblem(valX, valY, valWindows, tau)
+    mse0 = float(trainProblem.mse(baseline))
+    outputProblem = concordance_tier2.OutputLayerProblem(concordance_tier2.penultimate_features(baseline, X), y,
+                                                         windows, tau)
+    lsRatio = outputProblem.mse(outputProblem.least_squares()) / outputProblem.mse(
+        outputProblem.pack(*baseline.layers[-1].get_weights()))
+    print(f"[CONCORDANCE] {len(windows)} training windows, {len(valWindows)} validation windows; "
+          f"MSE0 {mse0:.6g}, MSE_LS / MSE0 {lsRatio:.4f}")
+
+    variants = [("baseline", None, baseline.get_weights(), 0.0)]
+    if "slsqp_output" in solvers:
+        print("[CONCORDANCE] slsqp_output: SLSQP on the output layer...")
+        sweep = concordance_tier2.slsqp_output_sweep(outputProblem, outputProblem.pack(
+            *baseline.layers[-1].get_weights()), epsGrid, concordanceConfig.get("MAX_ITER", 200))
+        for eps, r in sweep.items():
+            kernel, bias = outputProblem.unpack(r["w"])
+            weights = baseline.get_weights()[:-2] + [kernel.astype(np.float32), bias.astype(np.float32)]
+            variants.append(("slsqp_output", eps, weights, r["seconds"]))
+    switching = concordanceConfig.get("SWITCHING", {})
+    for solver, variables in (("switching_output", "output"), ("switching_all", "all")):
+        if solver in solvers:
+            print(f"[CONCORDANCE] {solver}: switching gradient on {variables} weights...")
+            searchModel = tf.keras.models.clone_model(baseline)
+            searchModel.set_weights(baseline.get_weights())
+            sweep = concordance_tier2.switching_sweep(
+                searchModel, trainProblem, epsGrid, variables, steps=switching.get("STEPS", 300),
+                check_every=switching.get("CHECK_EVERY", 10), lr_c=switching.get("LR_C", 1e-3),
+                lr_mse=switching.get("LR_MSE", 1e-3), batch_size=switching.get("BATCH_SIZE", 256),
+                seed=switching.get("SEED", 0))
+            variants += [(solver, eps, r["weights"], r["seconds"]) for eps, r in sweep.items()]
+
+    rows = []
+    for solver, eps, weights, seconds in variants:
+        name = solver if eps is None else f"{solver}_eps{eps:g}"
+        model = tf.keras.models.clone_model(baseline)
+        model.set_weights(weights)
+        if eps is not None:
+            save_model(model, SAVED_MODEL_LOCATION+region+"/"+region+"_"+name+".h5")
+
+        print(f"[CONCORDANCE] {name}: validation and test rollouts...")
+        _, val = rolloutAndScore(model, trainData, wTrainData, valData, wValData, validationDates,
+                                 ftMin, ftMax, wFtMin, wFtMax, numFeatures, forecastColumns)
+        (actual, predicted, dates), test = rolloutAndScore(model, valData, wValData, testData, wTestData,
+                                                           testDates, ftMin, ftMax, wFtMin, wFtMax,
+                                                           numFeatures, forecastColumns)
+        rows.append({"variant": name, "solver": solver, "eps": "" if eps is None else eps,
+                     "train_mse_ratio": float(trainProblem.mse(model)) / mse0,
+                     "train_smooth_C_A": float(trainProblem.c(model)),
+                     "val_smooth_C_A": float(valProblem.c(model)),
+                     "val_C": val["c"], "val_MAPE": val["mape"], "val_MAE": val["mae"],
+                     "test_C": test["c"], "test_MAPE": test["mape"], "test_MAE": test["mae"],
+                     "mse_ls_ratio": lsRatio, "solver_seconds": seconds})
+        print(f"[CONCORDANCE] {name}: " + ", ".join(f"{k} {v:.4f}" for k, v in rows[-1].items()
+                                                    if isinstance(v, float)))
+        common.writeOutFile(outFileNamePrefix+"_"+name+"_"+str(exptNum)+".csv",
+                            [[str(d), str(a), str(p)] for d, a, p in zip(dates, actual, predicted)],
+                            "carbon_intensity", "w")
+
+    summary = pd.DataFrame(rows)
+    tuned = summary["solver"] != "baseline"
+    summary["best_eps_for_solver"] = tuned & (summary["val_C"] == summary.groupby("solver")["val_C"].transform("max"))
+    summary["chosen_on_val"] = tuned & (summary.index == summary[tuned]["val_C"].idxmax())
+    summaryFileName = outFileNamePrefix+"_concordance_summary_"+str(exptNum)+".csv"
+    summary.to_csv(summaryFileName, index=False)
+    print(f"[CONCORDANCE] chosen on validation: {summary.loc[summary['chosen_on_val'], 'variant'].iloc[0]}. "
+          f"Summary: {summaryFileName}")
+    print(summary.to_string(index=False))
+    return summary
 
 def runSecondTierInRealTime(configFileName, regionList, cefType, startDate, electricityDataDate, 
                                realTimeFileDir, realTimeWeatherFileDir,
