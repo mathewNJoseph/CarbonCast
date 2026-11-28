@@ -108,7 +108,7 @@ def last_full_day(df):
     """The last day whose 23:00 hour is present in an hourly, sorted DataFrame."""
     return (df.index[-1] + pd.Timedelta(hours=1)).normalize() - pd.Timedelta(days=1)
 
-def modify_data_for_chunk(chunk_type, region, config):
+def modify_data_for_chunk(chunk_type, region, config, cef):
     """
     Write the chunk's emissions and forecast files, cut so that
     secondTierForecasts' row-count split lands on the dates in CHUNKS.
@@ -123,25 +123,25 @@ def modify_data_for_chunk(chunk_type, region, config):
     moved back to the last day the data supports and a warning names the
     skipped days.
 
-    Returns the three file paths, NUM_VAL_DAYS and NUM_TEST_DAYS.
+    Only the emissions of cef ("direct" or "lifecycle"), the type being run, are read, so a region needs
+    no file for the other type.
+
+    Returns the emissions and forecast file paths, NUM_VAL_DAYS and NUM_TEST_DAYS.
     """
 
     # Read the full dataset
-    direct_emissions_path = f"data/{region}/{region}_direct_emissions.csv"
-    lifecycle_emissions_path = f"data/{region}/{region}_lifecycle_emissions.csv"
+    emissions_path = f"data/{region}/{region}_{cef}_emissions.csv"
     forecasts_path = f"data/{region}/{region}_168hr_forecasts_DA.csv"
     
     print(f"Modifying data files for {chunk_type} chunk...")
     
     # Read the datasets
-    direct_df = pd.read_csv(direct_emissions_path, parse_dates=['UTC time'], index_col=['UTC time'])
-    lifecycle_df = pd.read_csv(lifecycle_emissions_path, parse_dates=['UTC time'], index_col=['UTC time'])
+    emissions_df = pd.read_csv(emissions_path, parse_dates=['UTC time'], index_col=['UTC time'])
     forecasts_df = pd.read_csv(forecasts_path, parse_dates=['datetime'], index_col=['datetime'])
     
     # Sort by index to ensure monotonic datetime index. The forecasts file is
     # deliberately NOT sorted: see select_forecast_blocks.
-    direct_df = direct_df.sort_index()
-    lifecycle_df = lifecycle_df.sort_index()
+    emissions_df = emissions_df.sort_index()
 
     block_hours = config["MAX_PREDICTION_WINDOW_HOURS"]
     prediction_hours = config["PREDICTION_WINDOW_HOURS"]
@@ -150,8 +150,7 @@ def modify_data_for_chunk(chunk_type, region, config):
 
     # A test period ending on day d needs actuals through d + buffer_days, and
     # select_forecast_blocks needs one forecast block per day through d.
-    supported_end = min(last_full_day(direct_df) - buffer_days,
-                        last_full_day(lifecycle_df) - buffer_days,
+    supported_end = min(last_full_day(emissions_df) - buffer_days,
                         forecasts_df.index[::block_hours].max())
     test_end = min(dates["test_end"], supported_end)
     if test_end < dates["test_start"]:
@@ -171,49 +170,43 @@ def modify_data_for_chunk(chunk_type, region, config):
     num_test_days = (test_end - dates["test_start"]).days + 1
 
     # Filter datasets by date range
-    direct_chunk = direct_df[start_date:end_date]
-    lifecycle_chunk = lifecycle_df[start_date:end_date]
+    emissions_chunk = emissions_df[start_date:end_date]
     expected_hours = len(pd.date_range(start_date, end_date, freq="h"))
-    for name, chunk in (("direct", direct_chunk), ("lifecycle", lifecycle_chunk)):
-        if len(chunk) != expected_hours:
-            raise ValueError(f"{region} {name} emissions have {len(chunk)} rows for {start_date} to {end_date}, "
-                             f"not one per hour ({expected_hours}); the row-count split needs every hour")
+    if len(emissions_chunk) != expected_hours:
+        raise ValueError(f"{region} {cef} emissions have {len(emissions_chunk)} rows for {start_date} to {end_date}, "
+                         f"not one per hour ({expected_hours}); the row-count split needs every hour")
     forecasts_chunk = select_forecast_blocks(forecasts_df, start_date, end_date, block_hours, prediction_hours)
     
     # Save temporary chunk files
     chunk_dir = f"data/{region}/temp_{chunk_type}"
     os.makedirs(chunk_dir, exist_ok=True)
     
-    direct_chunk_path = f"{chunk_dir}/{region}_direct_emissions_{chunk_type}.csv"
-    lifecycle_chunk_path = f"{chunk_dir}/{region}_lifecycle_emissions_{chunk_type}.csv"
+    emissions_chunk_path = f"{chunk_dir}/{region}_{cef}_emissions_{chunk_type}.csv"
     forecasts_chunk_path = f"{chunk_dir}/{region}_168hr_forecasts_DA_{chunk_type}.csv"
     
     # Reset index to save UTC time as column
-    direct_chunk.reset_index().to_csv(direct_chunk_path, index=False)
-    lifecycle_chunk.reset_index().to_csv(lifecycle_chunk_path, index=False)
+    emissions_chunk.reset_index().to_csv(emissions_chunk_path, index=False)
     forecasts_chunk.reset_index().to_csv(forecasts_chunk_path, index=False)
     
     print(f"Created chunk data files for {chunk_type}:")
-    print(f"  Direct emissions: {direct_chunk_path}")
-    print(f"  Lifecycle emissions: {lifecycle_chunk_path}")
+    print(f"  {cef.capitalize()} emissions: {emissions_chunk_path}")
     print(f"  Forecasts: {forecasts_chunk_path}")
     print(f"  Date range: {start_date} to {end_date}")
-    print(f"  Data points: {len(direct_chunk)} hours")
+    print(f"  Data points: {len(emissions_chunk)} hours")
     print(f"  Train {start_date.date()}..{(dates['val_start'] - pd.Timedelta(days=1)).date()}, "
           f"val {dates['val_start'].date()}..{(dates['test_start'] - pd.Timedelta(days=1)).date()}, "
           f"test forecasts starting {dates['test_start'].date()}..{test_end.date()} ({num_test_days} days)")
 
-    return direct_chunk_path, lifecycle_chunk_path, forecasts_chunk_path, num_val_days, num_test_days
+    return emissions_chunk_path, forecasts_chunk_path, num_val_days, num_test_days
 
-def update_config_for_chunk_data(config_path, chunk_type, direct_path, lifecycle_path, forecasts_path, region,
+def update_config_for_chunk_data(config_path, chunk_type, cef, emissions_path, forecasts_path, region,
                                  num_val_days, num_test_days):
     """Point the config at the chunk's data files and set the chunk's day counts."""
     with open(config_path, 'r') as f:
         config = json.load(f)
 
     # Update file paths for the region
-    config[region]["DIRECT_CEF_IN_FILE_NAME"] = direct_path
-    config[region]["LIFECYCLE_CEF_IN_FILE_NAME"] = lifecycle_path
+    config[region][f"{cef.upper()}_CEF_IN_FILE_NAME"] = emissions_path
     config[region]["FORECAST_IN_FILE_NAME"] = forecasts_path
     config["NUM_VAL_DAYS"] = num_val_days
     config["NUM_TEST_DAYS"] = num_test_days
@@ -384,12 +377,13 @@ def main():
             chunk_config = create_chunk_config(args.config_file, chunk_type, chunk_config_path)
 
             # Create chunk-specific data files
-            direct_path, lifecycle_path, forecasts_path, num_val_days, num_test_days = modify_data_for_chunk(
-                chunk_type, args.region, chunk_config)
+            cef = "direct" if args.cef_type == "-d" else "lifecycle"
+            emissions_path, forecasts_path, num_val_days, num_test_days = modify_data_for_chunk(
+                chunk_type, args.region, chunk_config, cef)
 
             # Update config to use chunk data
-            update_config_for_chunk_data(chunk_config_path, chunk_type,
-                                       direct_path, lifecycle_path, forecasts_path, args.region,
+            update_config_for_chunk_data(chunk_config_path, chunk_type, cef,
+                                       emissions_path, forecasts_path, args.region,
                                        num_val_days, num_test_days)
             
             # Run forecasting for this chunk
