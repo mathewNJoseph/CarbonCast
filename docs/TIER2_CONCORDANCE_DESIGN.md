@@ -1,6 +1,8 @@
 # Tier 2 concordance: detailed design
 
-Status: **design; implementation started** (`src/concordance_tier2.py` has `smooth_c`). Line numbers refer to the
+Status: **implemented with objective C_A** (`src/concordance_tier2.py`; all three solvers of section 5.3). C_B is
+not planned: the only change to the model is the concordance objective, as in SARIMAX, which also scores
+teacher-forced practice forecasts. Section 6 describes the code as built. Line numbers elsewhere refer to the
 `CarbonCast-v3.2` branch as of 2026-11-24 (commit `801f1439fbf`). This expands `CONCORDANCE_INTEGRATION.md` sections
 4–6 for the second tier (the CNN-LSTM that forecasts carbon intensity) only. For background on the two tiers, see
 `HOW_CARBONCAST_WORKS.md`.
@@ -262,6 +264,10 @@ for step in range(S):
 - K (for example 20 steps), the two learning rates and S need a small tuning pass. Tune on train only, using the
   output-layer run: settings are good when its train C at each eps comes close to SLSQP's (5.1). Use the same
   settings for the whole-network run.
+- **Tuned (AECI direct H1, train only):** S = 600, K = 2, both learning rates 3e-3, MSE minibatches of 256. The
+  output-layer run's train C_A is then within 0.002 of SLSQP's up to eps = 0.1 (0.007 below at 0.25). Checking
+  every 10 steps left it 0.003–0.022 below, because only checked points are eligible and it kept crossing the
+  boundary between checks. Each eps starts from theta_0.
 
 ### 5.3 Comparing the solvers
 
@@ -303,18 +309,19 @@ is the variant that can help.
 **Choose on val, test once.** Pick eps and the winning variant on validation. Report all three variants' test
 numbers, but only after the pick is fixed.
 
-## 6. Where it plugs into the code (nothing edited)
+## 6. Where it plugs into the code
 
 | Location | What happens there |
 |---|---|
-| **Precondition (done):** `secondTierForecasts.py:502` and `select_forecast_blocks` in `run_6month_forecasting.py` | The weather stride and `sort_index` bugs are fixed (`CONCORDANCE_INTEGRATION.md` section 3). Without those fixes, X's weather (C_A) and the `wTrainData` blocks (C_B) would be misaligned. |
-| New module `src/concordance_tier2.py` | `build_windows`, `smooth_c`, `rollout_B`, `mse_train`, `solve_output_slsqp`, `switching_gradient`, `best_within` |
-| `trainingandValidationPhase`, after the `trainModel` call (`:868`) | Compute MSE_0, run the eps sweep and return `{"baseline": theta_0, "eps_<e>": theta_e, ...}`. Everything needed is already in scope. |
-| `trainModel`, `:524-584` | Unchanged. The existing `-s` flag loads the saved `<region>.h5` (`:535-538`), so the sweep can run on baselines you already have, with no retraining. `run_6month_forecasting.py` keeps one model per chunk, in `saved_second_tier_models/<direct or lifecycle>/<H1 or H2>/<region>/`. |
-| Main loop in `runSecondTier`, `:177-190` | Loop over the variants. Call the **unchanged** `getDayAheadForecasts` on test for each one and write one CI forecast CSV per variant. |
-| `getScores`, `:788-826` | Add the 168 h-window c-index, both lifelines and smooth, so it matches SARIMAX's forecast-week c-index. |
-| `secondTierConfig.json` | Add a `CONCORDANCE` block: `OBJECTIVE` (`C24`, `A` or `B`), `EPS`, `TAU`, `SOLVERS` (any of `slsqp_output`, `switching_output`, `switching_all`), `SEEDS`. |
-| `run_6month_forecasting.py`: `create_chunk_config`, `merge_forecast_results` | Pass the settings through and merge per variant. |
+| `src/concordance_tier2.py` | `smooth_c` and `hard_c` (the 168 h c-index, as lifelines without censoring); `practice_windows` (C_A's windows); `OutputLayerProblem` and `slsqp_output_sweep` (variant A, with `best_within` pooling); `ModelProblem` and `switching_sweep` (variants B and C). |
+| `runSecondTier`, after the baseline's forecasts are written | When `CONCORDANCE.SOLVERS` is non-empty, calls `runConcordanceSweep`. A config without it behaves exactly as before. |
+| `runConcordanceSweep` in `secondTierForecasts.py` | Builds the train and validation windows, runs each solver over the eps grid, saves each variant as `<region>_<solver>_eps<e>.h5`, rolls every variant (and the baseline) out on validation and test with the **unchanged** `getDayAheadForecasts`, writes one CI forecast CSV per variant and `<prefix>_concordance_summary_<iter>.csv`. |
+| `trainModel` | Unchanged. `-s` loads the saved baseline, so the sweep can run on existing baselines. |
+| `secondTierConfig.json` | `CONCORDANCE`: `OBJECTIVE` (`A`), `SOLVERS`, `EPS`, `TAU`, `MAX_ITER` (SLSQP), `SWITCHING` (`STEPS`, `CHECK_EVERY`, `LR_C`, `LR_MSE`, `BATCH_SIZE`, `SEED`). |
+
+The summary has one row per variant: train MSE ratio, train and validation smooth C_A, validation and test hard
+c-index, MAPE and MAE of the real rollouts, `MSE_LS / MSE0`, solver time, `best_eps_for_solver` and
+`chosen_on_val` (the variant with the highest validation c-index).
 
 **Validation and carry-over.** Build the same windows from `valX, valY, wValData` (Jul–Dec 2022 for H1). Use them
 only to measure each variant and to choose eps, never inside the solver.
@@ -324,12 +331,13 @@ only to measure each variant and to choose eps, never inside the solver.
 1. **Fix the two alignment bugs (done).** Both are fixed, and every training, validation and test input now gets
    weather for its own hours. Re-check this after any change to the weather data or the chunk dates.
 2. **Port `smooth_c`** and test it against the numpy version (done).
-3. **Headroom check on the baseline.** Compute C_24, C_A and C_B on train and val, plus the hard (lifelines) c-index
+3. **Headroom check on the baseline** (partly: the summary has train and validation C_A and the rollouts' hard
+   c-index; C_24 and C_B are not computed). Compute C_24, C_A and C_B on train and val, plus the hard (lifelines) c-index
    of the real test rollouts. A large C_A–C_B gap means C_A is not a safe stand-in for the test rollout.
-4. **Output-layer SLSQP with C_A** (variant A) over the eps grid. This should take minutes per chunk.
-5. **Switching gradient with C_A.** Tune it on the output layer until it matches A (variant B), then run it on the
-   whole network (variant C).
-6. **Repeat steps 4–5 with C_B.**
+4. **Output-layer SLSQP with C_A** (variant A) over the eps grid (done). About 30 minutes per chunk locally.
+5. **Switching gradient with C_A** (done). Tuned on the output layer until it matches A (variant B, section 5.2),
+   then run on the whole network (variant C).
+6. ~~Repeat steps 4–5 with C_B.~~ Not planned (see the status line).
 7. **Choose eps and the variant on val, then test once.** Run 3–5 seeds. Count a gain only if it beats the
    baseline's seed-to-seed spread (section 5.3). Report for every variant:
    - the MSE_train ratio, and `MSE_LS / MSE0`;

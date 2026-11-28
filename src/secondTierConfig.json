@@ -50,6 +50,28 @@
     "LIFECYCLE_SAVED_MODEL_LOCATION": "saved_second_tier_models/lifecycle/",
     "DIRECT_SAVED_MODEL_LOCATION": "saved_second_tier_models/direct/",
     "WRITE_CI_FORECASTS_TO_FILE": "True",
+
+    // Constrained concordance fine-tune after the baseline (docs/TIER2_CONCORDANCE_DESIGN.md). For each EPS,
+    // maximise the smooth c-index of the training practice windows (OBJECTIVE "A": seven teacher-forced
+    // day-ahead predictions) with the training MSE kept within (1+EPS) of the baseline's. Leave SOLVERS
+    // empty to train and score the baseline only.
+    "CONCORDANCE": {
+        "OBJECTIVE": "A",
+        "SOLVERS": ["slsqp_output", "switching_output", "switching_all"],
+        "EPS": [0, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25],
+        "TAU": 0.1,
+        "MAX_ITER": 200,      // slsqp_output: SLSQP iterations per start
+        // switching_output and switching_all. Tuned on AECI direct H1 training data only, so that
+        // switching_output's train C_A per eps comes within 0.002 of SLSQP's up to eps 0.1.
+        "SWITCHING": {
+            "STEPS": 600,
+            "CHECK_EVERY": 2,
+            "LR_C": 0.003,
+            "LR_MSE": 0.003,
+            "BATCH_SIZE": 256,
+            "SEED": 0
+        }
+    },
     
     "SECOND_TIER_CNN_LSTM_MODEL_HYPERPARAMS": {
         "EPOCH": 10,
